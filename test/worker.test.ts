@@ -19,6 +19,14 @@ describe('Worker API foundation', () => {
     expect(response.status).toBe(401);
     expect(await response.json()).toMatchObject({ error: { code: 'UNAUTHENTICATED' } });
   });
+  it('protects the SPA and static asset routes with the same identity boundary', async () => {
+    const response=await worker.fetch(new Request('https://mailhub.test/'),env());
+    expect(response.status).toBe(401);
+  });
+  it('serves the SPA only after local identity simulation is explicitly enabled', async () => {
+    const response=await worker.fetch(new Request('http://localhost/',{headers:{'X-MailHub-Local-Subject':'owner'}}),env({APP_ENV:'local',ALLOW_LOCAL_AUTH:'true',DB:{prepare:()=>({bind:()=>({first:async()=>({id:'owner-1'}),all:async()=>({results:[]}),run:async()=>({meta:{changes:0}})})}),batch:async()=>[]} as unknown as Env['DB']}));
+    expect(response.status).toBe(200);
+  });
   it('does not authorize local identity unless explicitly enabled in local mode', async () => {
     const response = await worker.fetch(new Request('https://mailhub.test/api/v1/me', { headers: { 'X-MailHub-Local-Subject': 'attacker' } }), env({ APP_ENV: 'production', ALLOW_LOCAL_AUTH: 'true' }));
     expect(response.status).toBe(401);

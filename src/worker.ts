@@ -177,7 +177,11 @@ const worker = {
       if(!owner)return error('UNAUTHENTICATED','Access authentication required',401);
       return completeGoogleOAuth(request,env,owner);
     }
-    if (!url.pathname.startsWith('/api/')) return env.ASSETS.fetch(request);
+    if (!url.pathname.startsWith('/api/')) {
+      if(url.pathname.startsWith('/cdn-cgi/')) return env.ASSETS.fetch(request);
+      if(!await ownerId(request,env))return error('UNAUTHENTICATED','Access authentication required',401);
+      return env.ASSETS.fetch(request);
+    }
     if (url.pathname === '/api/v1/health' && request.method === 'GET') return json({ ok: true, service: 'mailhub', environment: env.APP_ENV });
     const owner = await ownerId(request, env);
     if (!owner) return error('UNAUTHENTICATED', 'Access authentication required', 401);
