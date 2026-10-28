@@ -53,5 +53,19 @@ describe('Worker API foundation', () => {
     expect(objects).toHaveLength(1);
     expect(statements.some(sql => sql.includes("SET ingest_status='ready'"))).toBe(true);
   });
+  it('runs cleanup jobs under a lease and removes R2 objects before metadata', async () => {
+    const sqls: string[] = [], deleted: string[] = [];
+    const db = {
+      prepare: (sql: string) => ({ bind: (..._values: unknown[]) => ({
+        first: async <T,>() => null as T | null,
+        all: async <T,>() => ({ results: (sql.includes('FROM mailboxes WHERE status=') ? [] : sql.includes("FROM jobs WHERE kind='cleanup_mailbox'") ? [{ id:'job-1',user_id:'owner-1',target_id:'box-1',attempts:0,max_attempts:5 }] : sql.includes('FROM mail_objects mo JOIN emails') ? [{id:'obj-1',objectKey:'mail/box-1/message-1/text'}] : []) as T[] }),
+        run: async () => { sqls.push(sql); return { meta: { changes: sql.includes('UPDATE jobs SET status=\'running\'') ? 1 : 0 } }; },
+      }) }),
+      batch: async (statements: unknown[]) => { sqls.push('cleanup-batch'); return statements; },
+    };
+    await worker.scheduled({}, env({ DB: db as unknown as Env['DB'], MAIL_OBJECTS: { delete: async (keys: string|string[]) => { deleted.push(...(Array.isArray(keys)?keys:[keys])); } } as unknown as Env['MAIL_OBJECTS'] }));
+    expect(deleted).toEqual(['mail/box-1/message-1/text']);
+    expect(sqls).toContain('cleanup-batch');
+  });
 });
 

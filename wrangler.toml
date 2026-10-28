@@ -18,6 +18,9 @@ migrations_dir = "migrations"
 binding = "MAIL_OBJECTS"
 bucket_name = "mailhub-dev"
 
+[triggers]
+crons = ["*/1 * * * *"]
+
 [vars]
 APP_ENV = "production"
 MAIL_DOMAIN = "inbox.example.invalid"

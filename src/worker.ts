@@ -3,7 +3,7 @@ import { MIME_LIMITS, parseMime, type ParsedAttachment } from './ingestion/mime'
 import { sanitizeEmailHtml } from './security/sanitize-html';
 export interface Env {
   DB: { prepare(query: string): { bind(...values: unknown[]): { first<T>(): Promise<T | null>; all<T>(): Promise<{results?: T[]}>; run(): Promise<{meta?: {changes?: number}}> } }; batch(statements: unknown[]): Promise<unknown[]> };
-  MAIL_OBJECTS: { put(key: string, value: ArrayBuffer | ArrayBufferView | string, options?: { httpMetadata?: { contentType?: string } }): Promise<unknown>; get(key: string): Promise<{text(): Promise<string>; arrayBuffer(): Promise<ArrayBuffer>} | null> };
+  MAIL_OBJECTS: { put(key: string, value: ArrayBuffer | ArrayBufferView | string, options?: { httpMetadata?: { contentType?: string } }): Promise<unknown>; get(key: string): Promise<{text(): Promise<string>; arrayBuffer(): Promise<ArrayBuffer>} | null>; delete(keys: string | string[]): Promise<unknown> };
   ASSETS: { fetch(request: Request): Promise<Response> };
   APP_ENV: string;
   MAIL_DOMAIN: string;
@@ -55,7 +55,7 @@ async function ingestInbound(message: { to: string; raw: ReadableStream<Uint8Arr
   const objects: { id:string; key:string; kind:string; data:Uint8Array; contentType:string }[] = [];
   if (parsed.text) objects.push({id:`${emailId}-text`,key:`mail/${mailbox.id}/${emailId}/text`,kind:'text',data:new TextEncoder().encode(parsed.text),contentType:'text/plain; charset=utf-8'});
   if (parsed.html) objects.push({id:`${emailId}-html`,key:`mail/${mailbox.id}/${emailId}/html`,kind:'html',data:new TextEncoder().encode(parsed.html),contentType:'text/html; charset=utf-8'});
-  const statements = [env.DB.prepare("INSERT OR IGNORE INTO emails(id,user_id,source,mailbox_id,provider_message_id,message_id_header,from_address,to_addresses_json,subject,snippet,received_at_ms,created_at_ms,otp_candidates_json,ingest_status,source_generation,body_truncated) VALUES(?,?,'temporary',?,?,?,?,?,?,?,?,?,?,'staged',?,?)").bind(emailId,mailbox.user_id,mailbox.id,dedup,parsed.messageId,parsed.from,JSON.stringify(parsed.to),parsed.subject,parsed.snippet,parsed.receivedAt,now,JSON.stringify(parsed.otpCandidates),mailbox.generation,parsed.bodyTruncated ? 1 : 0)];
+  const statements = [env.DB.prepare("INSERT OR IGNORE INTO emails(id,user_id,source,mailbox_id,provider_message_id,message_id_header,from_address,to_addresses_json,subject,snippet,received_at_ms,created_at_ms,otp_candidates_json,ingest_status,source_generation,body_truncated) SELECT ?,?,'temporary',?,?,?,?,?,?,?,?,?,?,'staged',?,? FROM mailboxes WHERE id=? AND status='active' AND generation=? AND expires_at_ms>?").bind(emailId,mailbox.user_id,mailbox.id,dedup,parsed.messageId,parsed.from,JSON.stringify(parsed.to),parsed.subject,parsed.snippet,parsed.receivedAt,now,JSON.stringify(parsed.otpCandidates),mailbox.generation,parsed.bodyTruncated ? 1 : 0,mailbox.id,mailbox.generation,now)];
   for (const [index,attachment] of parsed.attachments.entries()) {
     const attachmentId = `${emailId}-att-${index}`;
     if (attachment.skippedReason === null) {
@@ -74,7 +74,47 @@ async function ingestInbound(message: { to: string; raw: ReadableStream<Uint8Arr
     await env.DB.prepare("UPDATE mail_objects SET status='uploaded',checksum_sha256=? WHERE id=? AND email_id=?").bind(await sha256(object.data),object.id,emailId).run();
   }
   const finalized = await env.DB.prepare("UPDATE emails SET ingest_status='ready' WHERE id=? AND user_id=? AND ingest_status='staged' AND source_generation=(SELECT generation FROM mailboxes WHERE id=? AND status='active' AND expires_at_ms>?)").bind(emailId,mailbox.user_id,mailbox.id,Date.now()).run();
-  if ((finalized.meta?.changes ?? 0) !== 1) throw new Error('Mailbox changed during message ingestion');
+  if ((finalized.meta?.changes ?? 0) !== 1) {
+    await env.MAIL_OBJECTS.delete(objects.map(object => object.key));
+    throw new Error('Mailbox changed during message ingestion');
+  }
+}
+
+async function runScheduled(env: Env) {
+  const now = Date.now();
+  const expired = await env.DB.prepare("SELECT id,user_id FROM mailboxes WHERE status='active' AND expires_at_ms<=? LIMIT 50").bind(now).all<{id:string;user_id:string}>();
+  for (const box of expired.results ?? []) {
+    const jobId = crypto.randomUUID();
+    await env.DB.batch([
+      env.DB.prepare("UPDATE mailboxes SET status='deleting',generation=generation+1,deleted_at_ms=? WHERE id=? AND status='active' AND expires_at_ms<=?").bind(now,box.id,now),
+      env.DB.prepare("INSERT OR IGNORE INTO jobs(id,user_id,kind,target_id,dedup_key,status,available_at_ms,created_at_ms,updated_at_ms) SELECT ?,user_id,'cleanup_mailbox',id,'cleanup_mailbox:'||id,'pending',?,?,? FROM mailboxes WHERE id=? AND user_id=? AND status='deleting'").bind(jobId,now,now,now,box.id,box.user_id),
+    ]);
+  }
+  const due = await env.DB.prepare("SELECT id,user_id,target_id,attempts,max_attempts FROM jobs WHERE kind='cleanup_mailbox' AND status IN ('pending','retry_wait') AND available_at_ms<=? AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms<=?) ORDER BY created_at_ms LIMIT 10").bind(now,now).all<{id:string;user_id:string;target_id:string;attempts:number;max_attempts:number}>();
+  for (const job of due.results ?? []) {
+    const lease = crypto.randomUUID();
+    const claimed = await env.DB.prepare("UPDATE jobs SET status='running',attempts=attempts+1,lease_token=?,lease_expires_at_ms=?,updated_at_ms=? WHERE id=? AND status IN ('pending','retry_wait') AND available_at_ms<=? AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms<=?)").bind(lease,now+60_000,now,job.id,now,now).run();
+    if (claimed.meta?.changes !== 1) continue;
+    try { await cleanupMailbox(env,job.target_id,job.user_id,job.id,lease,now); }
+    catch {
+      const attempts = job.attempts+1, dead = attempts >= job.max_attempts;
+      const delay = Math.min(60*60_000, 1000*2**Math.min(attempts,12));
+      await env.DB.prepare('UPDATE jobs SET status=?,available_at_ms=?,lease_token=NULL,lease_expires_at_ms=NULL,error_code=?,updated_at_ms=? WHERE id=? AND lease_token=?').bind(dead?'dead':'retry_wait',now+delay,'CLEANUP_FAILED',Date.now(),job.id,lease).run();
+    }
+  }
+}
+
+async function cleanupMailbox(env: Env, mailboxId: string, userId: string, jobId: string, lease: string, now: number) {
+  const objects = await env.DB.prepare("SELECT mo.id,mo.object_key AS objectKey FROM mail_objects mo JOIN emails e ON e.id=mo.email_id WHERE e.mailbox_id=? AND e.user_id=? AND mo.status!='deleted'").bind(mailboxId,userId).all<{id:string;objectKey:string}>();
+  for (const object of objects.results ?? []) await env.MAIL_OBJECTS.delete(object.objectKey);
+  await env.DB.batch([
+    env.DB.prepare("UPDATE mail_objects SET status='deleted' WHERE id IN (SELECT mo.id FROM mail_objects mo JOIN emails e ON e.id=mo.email_id WHERE e.mailbox_id=? AND e.user_id=?)").bind(mailboxId,userId),
+    env.DB.prepare('DELETE FROM email_attachments WHERE email_id IN (SELECT id FROM emails WHERE mailbox_id=? AND user_id=?)').bind(mailboxId,userId),
+    env.DB.prepare('DELETE FROM mail_objects WHERE email_id IN (SELECT id FROM emails WHERE mailbox_id=? AND user_id=?)').bind(mailboxId,userId),
+    env.DB.prepare('DELETE FROM emails WHERE mailbox_id=? AND user_id=?').bind(mailboxId,userId),
+    env.DB.prepare("UPDATE mailboxes SET status='deleted' WHERE id=? AND user_id=? AND status='deleting'").bind(mailboxId,userId),
+    env.DB.prepare("UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at_ms=NULL,error_code=NULL,updated_at_ms=? WHERE id=? AND lease_token=?").bind(now,jobId,lease),
+  ]);
 }
 
 async function ownerId(request: Request, env: Env): Promise<string | null> {
@@ -220,6 +260,9 @@ const worker = {
   },
   async email(message: { to: string; raw: ReadableStream<Uint8Array>; rawSize: number; setReject(reason: string): void }, env: Env) {
     await ingestInbound(message,env);
+  },
+  async scheduled(_controller: unknown, env: Env) {
+    await runScheduled(env);
   },
 };
 export default worker;
