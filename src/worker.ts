@@ -207,7 +207,7 @@ async function cleanupMailbox(env: Env, mailboxId: string, userId: string, jobId
 
 async function ownerId(request: Request, env: Env): Promise<string | null> {
   let subject: string | null = null;
-  if (env.APP_ENV === 'local' && env.ALLOW_LOCAL_AUTH === 'true') subject = request.headers.get('X-MailHub-Local-Subject');
+  if (env.APP_ENV === 'local' && env.ALLOW_LOCAL_AUTH === 'true') subject = request.headers.get('X-MailHub-Local-Subject') ?? 'local-owner';
   else if (env.ACCESS_TEAM_DOMAIN && env.ACCESS_AUD) subject = await accessSubject(request, env.ACCESS_TEAM_DOMAIN, env.ACCESS_AUD);
   if (!subject) return null;
   const issuer = env.APP_ENV === 'local' ? 'local' : env.ACCESS_TEAM_DOMAIN!;
