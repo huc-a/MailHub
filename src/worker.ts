@@ -240,6 +240,31 @@ const worker = {
     const owner = await ownerId(request, env);
     if (!owner) return error('UNAUTHENTICATED', 'Access authentication required', 401);
     if (url.pathname === '/api/v1/me' && request.method === 'GET') return json({ id: owner });
+    if (url.pathname === '/api/v1/jobs' && request.method === 'GET') {
+      const limit=Math.min(100,Math.max(1,Number(url.searchParams.get('limit')??50)||50));
+      const result=await env.DB.prepare("SELECT j.id,j.kind,j.target_id AS targetId,COALESCE(pa.email_address,mb.address,'') AS targetLabel,j.status,j.attempts,j.max_attempts AS maxAttempts,j.available_at_ms AS availableAt,j.error_code AS errorCode,j.created_at_ms AS createdAt,j.updated_at_ms AS updatedAt FROM jobs j LEFT JOIN provider_accounts pa ON j.kind='sync' AND pa.id=j.target_id AND pa.user_id=j.user_id LEFT JOIN mailboxes mb ON j.kind='cleanup_mailbox' AND mb.id=j.target_id AND mb.user_id=j.user_id WHERE j.user_id=? ORDER BY j.created_at_ms DESC,j.id DESC LIMIT ?").bind(owner,limit).all<Record<string,unknown>>();
+      return json({jobs:result.results??[]});
+    }
+    const retryJobPath=url.pathname.match(/^\/api\/v1\/jobs\/([0-9a-f-]{36})\/retry$/i);
+    if(retryJobPath&&request.method==='POST'){
+      if(!sameOrigin(request))return error('CSRF_REJECTED','Same-origin request required',403);
+      const job=await env.DB.prepare('SELECT id,kind,target_id AS targetId,dedup_key AS dedupKey,status FROM jobs WHERE id=? AND user_id=?').bind(retryJobPath[1],owner).first<{id:string;kind:string;targetId:string;dedupKey:string;status:string}>();
+      if(!job)return error('NOT_FOUND','Job not found',404);
+      if(!['dead','retry_wait'].includes(job.status))return error('JOB_NOT_RETRYABLE','Only failed or waiting jobs can be retried',409);
+      if(job.kind==='sync'){
+        const account=await env.DB.prepare("SELECT auth_status AS authStatus FROM provider_accounts WHERE id=? AND user_id=? AND provider='gmail'").bind(job.targetId,owner).first<{authStatus:string}>();
+        if(!account)return error('NOT_FOUND','Gmail account not found',404);
+        if(account.authStatus!=='connected')return error('GMAIL_REAUTH_REQUIRED','Reconnect Gmail before retrying this job',409);
+      }
+      const live=await env.DB.prepare("SELECT id FROM jobs WHERE dedup_key=? AND id<>? AND status IN ('pending','running','retry_wait')").bind(job.dedupKey,job.id).first<{id:string}>();
+      if(live)return error('JOB_ALREADY_ACTIVE','Another job for this resource is already active',409);
+      const now=Date.now();
+      const retried=await env.DB.prepare("UPDATE jobs SET status='pending',attempts=0,available_at_ms=?,lease_token=NULL,lease_expires_at_ms=NULL,error_code=NULL,updated_at_ms=? WHERE id=? AND user_id=? AND status IN ('dead','retry_wait') AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms<=?)").bind(now,now,job.id,owner,now).run();
+      if(retried.meta?.changes!==1)return error('JOB_CHANGED','Job state changed; refresh and retry',409);
+      if(job.kind==='sync')await env.DB.prepare("UPDATE provider_accounts SET sync_status='queued',next_sync_at_ms=?,lease_token=NULL,lease_expires_at_ms=NULL WHERE id=? AND user_id=? AND auth_status='connected'").bind(now,job.targetId,owner).run();
+      const updated=await env.DB.prepare('SELECT id,status,attempts,updated_at_ms AS updatedAt FROM jobs WHERE id=? AND user_id=?').bind(job.id,owner).first<Record<string,unknown>>();
+      return json({job:updated},202);
+    }
     if(url.pathname==='/api/v1/accounts'&&request.method==='GET'){
       const result=await env.DB.prepare('SELECT id,provider,email_address AS emailAddress,auth_status AS authStatus,sync_status AS syncStatus,last_synced_at_ms AS lastSyncedAt FROM provider_accounts WHERE user_id=? ORDER BY created_at_ms DESC').bind(owner).all<Record<string,unknown>>();
       return json({accounts:result.results??[]});

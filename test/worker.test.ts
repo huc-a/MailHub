@@ -160,6 +160,18 @@ describe('Worker API foundation', () => {
     const response=await worker.fetch(new Request('http://localhost/api/v1/accounts/123e4567-e89b-42d3-a456-426614174000/sync',{method:'POST',headers:{Origin:'http://localhost','X-MailHub-Local-Subject':'owner'}}),env({APP_ENV:'local',ALLOW_LOCAL_AUTH:'true',DB:db as unknown as Env['DB']}));
     expect(response.status).toBe(202);expect(await response.json()).toMatchObject({jobId:'job-sync-1',status:'pending'});
   });
+  it('lists only safe job fields scoped to the authenticated owner', async () => {
+    let query='', values:unknown[]=[];
+    const db={prepare:(sql:string)=>({bind:(...bound:unknown[])=>{query=sql;values=bound;return {first:async()=>({id:'owner-1'}),all:async()=>({results:[{id:'job-1',kind:'cleanup_mailbox',status:'succeeded'}]}),run:async()=>({meta:{changes:0}})};}}),batch:async()=>[]};
+    const response=await worker.fetch(new Request('https://mailhub.test/api/v1/jobs?limit=25',{headers:{'X-MailHub-Local-Subject':'owner'}}),env({APP_ENV:'local',ALLOW_LOCAL_AUTH:'true',DB:db as unknown as Env['DB']}));
+    expect(response.status).toBe(200);expect(query).toContain('WHERE j.user_id=?');expect(query).not.toContain('payload_json');expect(query).not.toContain('lease_token');expect(values).toEqual(['owner-1',25]);expect(await response.json()).toMatchObject({jobs:[{id:'job-1'}]});
+  });
+  it('retries an owner-scoped failed cleanup job and resets its durable state', async () => {
+    const sqls:string[]=[];
+    const db={prepare:(sql:string)=>({bind:(..._values:unknown[])=>({first:async<T,>()=>{sqls.push(sql);if(sql.includes('FROM users'))return {id:'owner-1'};if(sql.includes('SELECT id,kind,target_id'))return {id:'job-1',kind:'cleanup_mailbox',targetId:'box-1',dedupKey:'cleanup_mailbox:box-1',status:'dead'};if(sql.includes('SELECT id FROM jobs WHERE dedup_key'))return null;if(sql.includes('SELECT id,status,attempts'))return {id:'job-1',status:'pending',attempts:0};return null as T|null;},all:async()=>({results:[]}),run:async()=>{sqls.push(sql);return {meta:{changes:1}};}})}),batch:async()=>[]};
+    const response=await worker.fetch(new Request('http://localhost/api/v1/jobs/11111111-1111-4111-8111-111111111111/retry',{method:'POST',headers:{Origin:'http://localhost','X-MailHub-Local-Subject':'owner'}}),env({APP_ENV:'local',ALLOW_LOCAL_AUTH:'true',DB:db as unknown as Env['DB']}));
+    expect(response.status).toBe(202);expect(sqls.some(sql=>sql.includes("SET status='pending',attempts=0"))).toBe(true);expect(await response.json()).toMatchObject({job:{id:'job-1',status:'pending'}});
+  });
   it('runs a bounded Gmail bootstrap job through MIME parsing and staged storage', async () => {
     const key=btoa('k'.repeat(32)),cipher=await encryptSecret('refresh-token',key,'provider-account:owner-1:account-1:gmail'),sqls:string[]=[],objects:string[]=[];
     const db={prepare:(sql:string)=>({sql,bind:(..._values:unknown[])=>({sql,first:async<T,>()=>(sql.includes('SELECT encrypted_refresh_token')?{encrypted_refresh_token:cipher,key_version:'v1',committed_cursor:null,email_address:'owner@gmail.test'}:sql.includes('SELECT id,ingest_status')?null:null) as T|null,all:async<T,>()=>({results:(sql.includes("FROM jobs WHERE kind='sync'")?[{id:'job-1',user_id:'owner-1',target_id:'account-1',attempts:0,max_attempts:5}]:[]) as T[]}),run:async()=>{sqls.push(sql);return {meta:{changes:1}};}})}),batch:async(statements:{sql:string}[])=>{sqls.push(...statements.map(item=>item.sql));return statements;}};
