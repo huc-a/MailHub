@@ -19,6 +19,5 @@ binding = "MAIL_OBJECTS"
 bucket_name = "mailhub-dev"
 
 [vars]
-APP_ENV = "local"
+APP_ENV = "production"
 MAIL_DOMAIN = "inbox.example.invalid"
-

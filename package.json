@@ -10,7 +10,10 @@
     "typecheck": "tsc --noEmit",
     "cf:types": "wrangler types"
   },
-  "dependencies": { "vue": "^3.5.13" },
+  "dependencies": {
+    "jose": "^6.2.13",
+    "vue": "^3.5.13"
+  },
   "devDependencies": {
     "@cloudflare/vite-plugin": "^1.13.12",
     "@cloudflare/workers-types": "^5.20261028.1",
@@ -21,4 +24,3 @@
     "wrangler": "^4.45.0"
   }
 }
-
