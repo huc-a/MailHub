@@ -1,8 +1,9 @@
 import { accessSubject } from './access';
 import { MIME_LIMITS, parseMime, type ParsedAttachment } from './ingestion/mime';
+import { sanitizeEmailHtml } from './security/sanitize-html';
 export interface Env {
   DB: { prepare(query: string): { bind(...values: unknown[]): { first<T>(): Promise<T | null>; all<T>(): Promise<{results?: T[]}>; run(): Promise<{meta?: {changes?: number}}> } }; batch(statements: unknown[]): Promise<unknown[]> };
-  MAIL_OBJECTS: { put(key: string, value: ArrayBuffer | ArrayBufferView | string, options?: { httpMetadata?: { contentType?: string } }): Promise<unknown> };
+  MAIL_OBJECTS: { put(key: string, value: ArrayBuffer | ArrayBufferView | string, options?: { httpMetadata?: { contentType?: string } }): Promise<unknown>; get(key: string): Promise<{text(): Promise<string>; arrayBuffer(): Promise<ArrayBuffer>} | null> };
   ASSETS: { fetch(request: Request): Promise<Response> };
   APP_ENV: string;
   MAIL_DOMAIN: string;
@@ -179,6 +180,41 @@ const worker = {
       const emails = result.results ?? [];
       const last = emails.at(-1);
       return json({ emails, nextCursor: emails.length === limit && last ? `${last.receivedAt}.${last.id}` : null });
+    }
+    const readPath = url.pathname.match(/^\/api\/v1\/emails\/([0-9a-f-]{36})(?:\/(html|attachments\/([^/]{1,128})))?$/i);
+    if (readPath && request.method === 'GET') {
+      const emailId = readPath[1];
+      const scope = "e.id=? AND e.user_id=? AND e.ingest_status='ready' AND (e.source!='temporary' OR EXISTS(SELECT 1 FROM mailboxes mb WHERE mb.id=e.mailbox_id AND mb.status='active' AND mb.expires_at_ms>?))";
+      if (readPath[2] === 'html') {
+        const object = await env.DB.prepare(`SELECT mo.object_key AS objectKey FROM mail_objects mo JOIN emails e ON e.id=mo.email_id WHERE ${scope} AND mo.kind='html' AND mo.status='uploaded'`).bind(emailId,owner,Date.now()).first<{objectKey:string}>();
+        if (!object) return error('NOT_FOUND','Email not found',404);
+        const stored = await env.MAIL_OBJECTS.get(object.objectKey);
+        if (!stored) return error('NOT_FOUND','Email content not found',404);
+        return new Response(sanitizeEmailHtml(await stored.text()), { headers: { 'Content-Type':'text/html; charset=utf-8','Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff','Content-Security-Policy':"default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; form-action 'none'; base-uri 'none'; sandbox" } });
+      }
+      if (readPath[3]) {
+        if (!/^[0-9a-f-]{36}-att-\d+$/i.test(readPath[3])) return error('NOT_FOUND','Attachment not found',404);
+        const item = await env.DB.prepare(`SELECT ea.filename,ea.content_type AS contentType,mo.object_key AS objectKey FROM email_attachments ea JOIN emails e ON e.id=ea.email_id JOIN mail_objects mo ON mo.id=ea.object_id WHERE ${scope} AND e.id=? AND ea.id=? AND ea.skipped_reason IS NULL AND mo.status='uploaded'`).bind(emailId,owner,Date.now(),emailId,readPath[3]).first<{filename:string;contentType:string;objectKey:string}>();
+        if (!item) return error('NOT_FOUND','Attachment not found',404);
+        const stored = await env.MAIL_OBJECTS.get(item.objectKey);
+        if (!stored) return error('NOT_FOUND','Attachment not found',404);
+        const filename = item.filename.replace(/[\r\n"\\]/g,'_').slice(0,180) || 'attachment';
+        return new Response(await stored.arrayBuffer(), { headers: { 'Content-Type':'application/octet-stream','Content-Disposition':`attachment; filename="${filename.replace(/[^\x20-\x7e]/g,'_')}"; filename*=UTF-8''${encodeURIComponent(filename)}`,'Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff' } });
+      }
+      const email = await env.DB.prepare(`SELECT e.id,e.source,e.mailbox_id AS mailboxId,e.from_address AS from,e.to_addresses_json AS toAddresses,e.subject,e.snippet,e.received_at_ms AS receivedAt,e.local_is_read AS localIsRead,e.otp_candidates_json AS otpCandidates,e.body_truncated AS bodyTruncated,mo.object_key AS textKey FROM emails e LEFT JOIN mail_objects mo ON mo.email_id=e.id AND mo.kind='text' AND mo.status='uploaded' WHERE ${scope}`).bind(emailId,owner,Date.now()).first<Record<string,unknown> & {textKey?:string}>();
+      if (!email) return error('NOT_FOUND','Email not found',404);
+      const stored = email.textKey ? await env.MAIL_OBJECTS.get(email.textKey) : null;
+      const attachments = await env.DB.prepare('SELECT id,filename,content_type AS contentType,size_bytes AS size,skipped_reason AS skippedReason FROM email_attachments WHERE email_id=? ORDER BY id').bind(emailId).all<Record<string,unknown>>();
+      return json({ email: { ...email, text: stored ? await stored.text() : '', toAddresses: JSON.parse(String(email.toAddresses)), otpCandidates: JSON.parse(String(email.otpCandidates)), attachments: attachments.results ?? [] } });
+    }
+    if (readPath && request.method === 'PATCH' && !readPath[2]) {
+      if (!sameOrigin(request)) return error('CSRF_REJECTED','Same-origin request required',403);
+      if (!validJson(request)) return error('UNSUPPORTED_MEDIA_TYPE','Content-Type must be application/json',415);
+      let body: {localIsRead?:unknown}; try { body = await request.json() as typeof body; } catch { return error('INVALID_JSON','Request body must be JSON',400); }
+      if (typeof body.localIsRead !== 'boolean') return error('INVALID_READ_STATE','localIsRead must be boolean',400);
+      const result = await env.DB.prepare("UPDATE emails SET local_is_read=? WHERE id=? AND user_id=? AND ingest_status='ready' AND (source!='temporary' OR EXISTS(SELECT 1 FROM mailboxes mb WHERE mb.id=emails.mailbox_id AND mb.status='active' AND mb.expires_at_ms>?))").bind(body.localIsRead ? 1 : 0,readPath[1],owner,Date.now()).run();
+      if ((result.meta?.changes ?? 0) !== 1) return error('NOT_FOUND','Email not found',404);
+      return json({ id:readPath[1],localIsRead:body.localIsRead });
     }
     return error('NOT_FOUND', 'API route not found', 404);
   },
