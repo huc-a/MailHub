@@ -43,11 +43,30 @@ describe('Worker API foundation', () => {
   });
   it('returns only ready email rows from the owner scoped query', async () => {
     let bindValues: unknown[] = [];
-    const db = { prepare: () => ({ bind: (...values: unknown[]) => { bindValues = values; return { first: async () => ({ id: 'owner-1' }), all: async () => ({ results: [{ id: 'mail-1', subject: 'Hello', receivedAt: 10 }] }), run: async () => ({ meta: { changes: 0 } }) }; } }), batch: async () => [] };
+    const queries: string[] = [];
+    const db = { prepare: (sql: string) => { queries.push(sql); return { bind: (...values: unknown[]) => { bindValues = values; return { first: async () => ({ id: 'owner-1' }), all: async () => ({ results: [{ id: 'mail-1', fromAddress: 'sender@example.net', subject: 'Hello', receivedAt: 10 }] }), run: async () => ({ meta: { changes: 0 } }) }; } }; }, batch: async () => [] };
     const response = await worker.fetch(new Request('https://mailhub.test/api/v1/emails', { headers: { 'X-MailHub-Local-Subject': 'owner' } }), env({ APP_ENV: 'local', ALLOW_LOCAL_AUTH: 'true', DB: db as unknown as Env['DB'] }));
     expect(response.status).toBe(200);
     expect(bindValues[0]).toBe('owner-1');
+    expect(queries.some(sql => sql.includes('from_address AS fromAddress'))).toBe(true);
     expect(await response.json()).toMatchObject({ emails: [{ id: 'mail-1' }] });
+  });
+  it('uses a valid quoted sender alias when loading an email detail', async () => {
+    const queries: string[] = [];
+    const db = {
+      prepare: (sql: string) => {
+        queries.push(sql);
+        return { bind: () => ({
+          first: async () => sql.includes('FROM users') ? { id: 'owner-1' } : sql.includes('FROM emails e') ? { id: 'mail-1', fromAddress: 'sender@example.net', toAddresses: '[]', otpCandidates: '[]' } : null,
+          all: async () => ({ results: [] }),
+          run: async () => ({ meta: { changes: 0 } }),
+        }) };
+      }, batch: async () => [],
+    };
+    const response = await worker.fetch(new Request('https://mailhub.test/api/v1/emails/11111111-1111-4111-8111-111111111111', { headers: { 'X-MailHub-Local-Subject': 'owner' } }), env({ APP_ENV: 'local', ALLOW_LOCAL_AUTH: 'true', DB: db as unknown as Env['DB'] }));
+    expect(response.status).toBe(200);
+    expect(queries.some(sql => sql.includes('e.from_address AS fromAddress'))).toBe(true);
+    expect(await response.json()).toMatchObject({ email: { fromAddress: 'sender@example.net' } });
   });
   it('stages and stores an accepted inbound message before making it ready', async () => {
     const statements: string[] = [], objects: string[] = [];

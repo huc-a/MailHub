@@ -338,8 +338,8 @@ const worker = {
       const cursor = url.searchParams.get('cursor');
       if (cursor && (!/^\d+\.[0-9a-f-]{36}$/i.test(cursor) || !Number.isSafeInteger(Number(cursor.split('.')[0])))) return error('INVALID_CURSOR', 'Invalid email cursor', 400);
       const query = cursor
-        ? "SELECT id,source,mailbox_id AS mailboxId,from_address AS from,subject,snippet,received_at_ms AS receivedAt,local_is_read AS localIsRead FROM emails WHERE user_id=? AND ingest_status='ready' AND (received_at_ms,id)<(?,?) ORDER BY received_at_ms DESC,id DESC LIMIT ?"
-        : "SELECT id,source,mailbox_id AS mailboxId,from_address AS from,subject,snippet,received_at_ms AS receivedAt,local_is_read AS localIsRead FROM emails WHERE user_id=? AND ingest_status='ready' ORDER BY received_at_ms DESC,id DESC LIMIT ?";
+        ? 'SELECT id,source,mailbox_id AS mailboxId,from_address AS fromAddress,subject,snippet,received_at_ms AS receivedAt,local_is_read AS localIsRead FROM emails WHERE user_id=? AND ingest_status=\'ready\' AND (received_at_ms,id)<(?,?) ORDER BY received_at_ms DESC,id DESC LIMIT ?'
+        : 'SELECT id,source,mailbox_id AS mailboxId,from_address AS fromAddress,subject,snippet,received_at_ms AS receivedAt,local_is_read AS localIsRead FROM emails WHERE user_id=? AND ingest_status=\'ready\' ORDER BY received_at_ms DESC,id DESC LIMIT ?';
       const statement = cursor
         ? env.DB.prepare(query).bind(owner,Number(cursor.split('.')[0]),cursor.split('.')[1],limit)
         : env.DB.prepare(query).bind(owner,limit);
@@ -368,7 +368,7 @@ const worker = {
         const filename = item.filename.replace(/[\r\n"\\]/g,'_').slice(0,180) || 'attachment';
         return new Response(await stored.arrayBuffer(), { headers: { 'Content-Type':'application/octet-stream','Content-Disposition':`attachment; filename="${filename.replace(/[^\x20-\x7e]/g,'_')}"; filename*=UTF-8''${encodeURIComponent(filename)}`,'Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff' } });
       }
-      const email = await env.DB.prepare(`SELECT e.id,e.source,e.mailbox_id AS mailboxId,e.from_address AS from,e.to_addresses_json AS toAddresses,e.subject,e.snippet,e.received_at_ms AS receivedAt,e.local_is_read AS localIsRead,e.otp_candidates_json AS otpCandidates,e.body_truncated AS bodyTruncated,mo.object_key AS textKey,EXISTS(SELECT 1 FROM mail_objects h WHERE h.email_id=e.id AND h.kind='html' AND h.status='uploaded') AS hasHtml FROM emails e LEFT JOIN mail_objects mo ON mo.email_id=e.id AND mo.kind='text' AND mo.status='uploaded' WHERE ${scope}`).bind(emailId,owner,Date.now()).first<Record<string,unknown> & {textKey?:string}>();
+      const email = await env.DB.prepare(`SELECT e.id,e.source,e.mailbox_id AS mailboxId,e.from_address AS fromAddress,e.to_addresses_json AS toAddresses,e.subject,e.snippet,e.received_at_ms AS receivedAt,e.local_is_read AS localIsRead,e.otp_candidates_json AS otpCandidates,e.body_truncated AS bodyTruncated,mo.object_key AS textKey,EXISTS(SELECT 1 FROM mail_objects h WHERE h.email_id=e.id AND h.kind='html' AND h.status='uploaded') AS hasHtml FROM emails e LEFT JOIN mail_objects mo ON mo.email_id=e.id AND mo.kind='text' AND mo.status='uploaded' WHERE ${scope}`).bind(emailId,owner,Date.now()).first<Record<string,unknown> & {textKey?:string}>();
       if (!email) return error('NOT_FOUND','Email not found',404);
       const stored = email.textKey ? await env.MAIL_OBJECTS.get(email.textKey) : null;
       const attachments = await env.DB.prepare('SELECT id,filename,content_type AS contentType,size_bytes AS size,skipped_reason AS skippedReason FROM email_attachments WHERE email_id=? ORDER BY id').bind(emailId).all<Record<string,unknown>>();
