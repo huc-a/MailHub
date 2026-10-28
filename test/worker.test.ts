@@ -100,7 +100,7 @@ describe('Worker API foundation', () => {
     const raw= btoa('From: hello@example.test\r\nTo: owner@gmail.test\r\nSubject: Gmail smoke\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nCode 654321');
     vi.stubGlobal('fetch',vi.fn(async(input:RequestInfo|URL)=>{const url=String(input);if(url.includes('oauth2.googleapis.com/token'))return Response.json({access_token:'access',expires_in:3600});if(url.endsWith('/profile'))return Response.json({emailAddress:'owner@gmail.test',historyId:'100'});if(url.includes('/messages?'))return Response.json({messages:[{id:'gmail-message-1',threadId:'thread-1'}]});if(url.includes('format=minimal'))return Response.json({id:'gmail-message-1',labelIds:['INBOX']});if(url.includes('format=raw'))return Response.json({id:'gmail-message-1',threadId:'thread-1',raw});throw new Error(`unexpected Gmail request: ${url}`);}));
     await worker.scheduled({},env({DB:db as unknown as Env['DB'],MAIL_OBJECTS:{put:async(key:string)=>{objects.push(key);},delete:async()=>{},get:async()=>null} as unknown as Env['MAIL_OBJECTS'],TOKEN_ENCRYPTION_KEY:key,GOOGLE_CLIENT_ID:'client',GOOGLE_CLIENT_SECRET:'secret'}));
-    expect(objects.some(key=>key.endsWith('/text'))).toBe(true);expect(sqls.some(sql=>sql.includes("SET ingest_status='ready'"))).toBe(true);expect(sqls.some(sql=>sql.includes("SET committed_cursor=?"))).toBe(true);
+    expect(objects.some(key=>key.endsWith('/text'))).toBe(true);expect(sqls.some(sql=>sql.includes('remote_is_read'))).toBe(true);expect(sqls.some(sql=>sql.includes("SET ingest_status='ready'"))).toBe(true);expect(sqls.some(sql=>sql.includes("SET committed_cursor=?"))).toBe(true);
   });
 });
 
