@@ -1,6 +1,6 @@
 import { accessSubject } from './access';
 export interface Env {
-  DB: { prepare(query: string): { bind(...values: unknown[]): { first<T>(): Promise<T | null>; all?(): Promise<{results?: unknown[]}>; run(): Promise<unknown> } } };
+  DB: { prepare(query: string): { bind(...values: unknown[]): { first<T>(): Promise<T | null>; all<T>(): Promise<{results?: T[]}>; run(): Promise<{meta?: {changes?: number}}> } }; batch(statements: unknown[]): Promise<unknown[]> };
   MAIL_OBJECTS: unknown;
   ASSETS: { fetch(request: Request): Promise<Response> };
   APP_ENV: string;
@@ -13,6 +13,8 @@ const json = (data: unknown, status = 200) => Response.json(data, { status, head
 const error = (code: string, message: string, status: number) => json({ error: { code, message, retryable: status >= 500, requestId: crypto.randomUUID() } }, status);
 const digest = async (value: string) => [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)))].map(x => x.toString(16).padStart(2, '0')).join('');
 const localPart = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), x => 'abcdefghijklmnopqrstuvwxyz234567'[x & 31]).join('');
+const sameOrigin = (request: Request) => request.headers.get('Origin') === new URL(request.url).origin;
+const validJson = (request: Request) => request.headers.get('Content-Type')?.split(';')[0].trim().toLowerCase() === 'application/json';
 
 async function ownerId(request: Request, env: Env): Promise<string | null> {
   let subject: string | null = null;
@@ -37,10 +39,12 @@ const worker = {
     if (!owner) return error('UNAUTHENTICATED', 'Access authentication required', 401);
     if (url.pathname === '/api/v1/me' && request.method === 'GET') return json({ id: owner });
     if (url.pathname === '/api/v1/mailboxes' && request.method === 'GET') {
-      const result = await env.DB.prepare("SELECT id,address,status,created_at_ms AS createdAt,expires_at_ms AS expiresAt FROM mailboxes WHERE user_id=? AND status IN ('active','expired') ORDER BY created_at_ms DESC").bind(owner).all?.();
-      return json({ mailboxes: result?.results ?? [] });
+      const result = await env.DB.prepare("SELECT id,address,CASE WHEN status='active' AND expires_at_ms<=? THEN 'expired' ELSE status END AS status,created_at_ms AS createdAt,expires_at_ms AS expiresAt FROM mailboxes WHERE user_id=? AND status IN ('active','expired') ORDER BY created_at_ms DESC LIMIT 100").bind(Date.now(),owner).all<Record<string, unknown>>();
+      return json({ mailboxes: result.results ?? [] });
     }
     if (url.pathname === '/api/v1/mailboxes' && request.method === 'POST') {
+      if (!sameOrigin(request)) return error('CSRF_REJECTED', 'Same-origin request required', 403);
+      if (!validJson(request)) return error('UNSUPPORTED_MEDIA_TYPE', 'Content-Type must be application/json', 415);
       let body: { ttlMinutes?: unknown };
       try { body = await request.json() as typeof body; } catch { return error('INVALID_JSON', 'Request body must be JSON', 400); }
       const ttl = body.ttlMinutes === undefined ? 60 : body.ttlMinutes;
@@ -69,6 +73,52 @@ const worker = {
       }
       await env.DB.prepare('INSERT INTO idempotency_keys(user_id,request_key,route,request_hash,resource_id,expires_at_ms) VALUES(?,?,?,?,?,?)').bind(owner,key,'/mailboxes',requestHash,id,now+86_400_000).run();
       return json({ mailbox: { id, address, status: 'active', createdAt: now, expiresAt: now+(ttl as number)*60_000 } }, 201);
+    }
+    const mailboxAction = url.pathname.match(/^\/api\/v1\/mailboxes\/([0-9a-f-]{36})(?:\/(renew))?$/i);
+    if (mailboxAction && request.method === 'POST' && mailboxAction[2] === 'renew') {
+      if (!sameOrigin(request)) return error('CSRF_REJECTED', 'Same-origin request required', 403);
+      if (!validJson(request)) return error('UNSUPPORTED_MEDIA_TYPE', 'Content-Type must be application/json', 415);
+      let body: { ttlMinutes?: unknown };
+      try { body = await request.json() as typeof body; } catch { return error('INVALID_JSON', 'Request body must be JSON', 400); }
+      const ttl = body.ttlMinutes === undefined ? 60 : body.ttlMinutes;
+      if (![10, 30, 60, 1440].includes(ttl as number)) return error('INVALID_TTL', 'ttlMinutes must be 10, 30, 60 or 1440', 400);
+      const id = mailboxAction[1], now = Date.now();
+      const mailbox = await env.DB.prepare('SELECT id,created_at_ms AS createdAt,expires_at_ms AS expiresAt,status FROM mailboxes WHERE id=? AND user_id=?').bind(id, owner).first<{id:string;createdAt:number;expiresAt:number;status:string}>();
+      if (!mailbox) return error('NOT_FOUND', 'Mailbox not found', 404);
+      if (mailbox.status !== 'active' || mailbox.expiresAt <= now) return error('MAILBOX_EXPIRED', 'Expired or deleting mailboxes cannot be renewed', 409);
+      const expiresAt = Math.min(now+(ttl as number)*60_000, mailbox.createdAt+24*60*60_000);
+      if (expiresAt <= mailbox.expiresAt) return error('MAILBOX_TTL_MAX', 'Mailbox has reached its maximum lifetime', 409);
+      const result = await env.DB.prepare("UPDATE mailboxes SET expires_at_ms=? WHERE id=? AND user_id=? AND status='active' AND expires_at_ms>? AND generation=(SELECT generation FROM mailboxes WHERE id=? AND user_id=?)").bind(expiresAt,id,owner,now,id,owner).run();
+      if ((result.meta?.changes ?? 0) !== 1) return error('MAILBOX_CHANGED', 'Mailbox state changed; reload and retry', 409);
+      return json({ mailbox: { id, expiresAt } });
+    }
+    if (mailboxAction && request.method === 'DELETE' && !mailboxAction[2]) {
+      if (!sameOrigin(request)) return error('CSRF_REJECTED', 'Same-origin request required', 403);
+      const id = mailboxAction[1], now = Date.now();
+      const mailbox = await env.DB.prepare('SELECT id,status FROM mailboxes WHERE id=? AND user_id=?').bind(id,owner).first<{id:string;status:string}>();
+      if (!mailbox) return error('NOT_FOUND', 'Mailbox not found', 404);
+      const jobId = crypto.randomUUID();
+      await env.DB.batch([
+        env.DB.prepare("UPDATE mailboxes SET status='deleting',generation=generation+1,deleted_at_ms=? WHERE id=? AND user_id=? AND status IN ('active','expired')").bind(now,id,owner),
+        env.DB.prepare("INSERT OR IGNORE INTO jobs(id,user_id,kind,target_id,dedup_key,status,available_at_ms,created_at_ms,updated_at_ms) SELECT ?,user_id,'cleanup_mailbox',id,'cleanup_mailbox:'||id,'pending',?,?,? FROM mailboxes WHERE id=? AND user_id=? AND status='deleting'").bind(jobId,now,now,now,id,owner),
+      ]);
+      const job = await env.DB.prepare("SELECT id,status FROM jobs WHERE dedup_key=? AND status IN ('pending','running','retry_wait')").bind(`cleanup_mailbox:${id}`).first<{id:string;status:string}>();
+      return json({ jobId: job?.id ?? jobId, status: job?.status ?? 'pending' }, 202);
+    }
+    if (url.pathname === '/api/v1/emails' && request.method === 'GET') {
+      const limit = Math.min(100,Math.max(1,Number(url.searchParams.get('limit') ?? 30) || 30));
+      const cursor = url.searchParams.get('cursor');
+      if (cursor && (!/^\d+\.[0-9a-f-]{36}$/i.test(cursor) || !Number.isSafeInteger(Number(cursor.split('.')[0])))) return error('INVALID_CURSOR', 'Invalid email cursor', 400);
+      const query = cursor
+        ? "SELECT id,source,mailbox_id AS mailboxId,from_address AS from,subject,snippet,received_at_ms AS receivedAt,local_is_read AS localIsRead FROM emails WHERE user_id=? AND ingest_status='ready' AND (received_at_ms,id)<(?,?) ORDER BY received_at_ms DESC,id DESC LIMIT ?"
+        : "SELECT id,source,mailbox_id AS mailboxId,from_address AS from,subject,snippet,received_at_ms AS receivedAt,local_is_read AS localIsRead FROM emails WHERE user_id=? AND ingest_status='ready' ORDER BY received_at_ms DESC,id DESC LIMIT ?";
+      const statement = cursor
+        ? env.DB.prepare(query).bind(owner,Number(cursor.split('.')[0]),cursor.split('.')[1],limit)
+        : env.DB.prepare(query).bind(owner,limit);
+      const result = await statement.all<Record<string, unknown>>();
+      const emails = result.results ?? [];
+      const last = emails.at(-1);
+      return json({ emails, nextCursor: emails.length === limit && last ? `${last.receivedAt}.${last.id}` : null });
     }
     return error('NOT_FOUND', 'API route not found', 404);
   },
