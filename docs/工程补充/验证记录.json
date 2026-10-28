@@ -1,0 +1,15 @@
+{
+  "javascript_syntax": "checked with Node --check",
+  "sqlite_tables": 10,
+  "sqlite_tests": {
+    "duplicate": "PASS: rejected",
+    "cross_owner": "PASS: rejected",
+    "invalid_source": "PASS: rejected"
+  },
+  "browser_e2e": "not executed",
+  "real_cloudflare_d1": "not executed",
+  "real_mail_delivery": "not executed",
+  "gmail_oauth": "not executed",
+  "document_characters": 22033,
+  "html_characters": 39272
+}

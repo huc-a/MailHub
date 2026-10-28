@@ -1,0 +1,1001 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "MailHub v2 API contract draft",
+    "version": "2.0.0-draft",
+    "description": "Design contract, not deployed. All /api routes return JSON except documented HTML/attachment streams. Server derives owner identity from verified Access JWT. Requests must enforce ownership, same-origin CSRF checks and runtime schema validation."
+  },
+  "servers": [
+    {
+      "url": "/api/v1"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "AccessAssertion": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "Cf-Access-Jwt-Assertion",
+        "description": "Injected by Cloudflare Access; validate signature, issuer, audience and expiry. Never trust caller-provided headers alone."
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message",
+              "retryable",
+              "requestId"
+            ],
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "requestId": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "JobAccepted": {
+        "type": "object",
+        "required": [
+          "jobId",
+          "status"
+        ],
+        "properties": {
+          "jobId": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "running",
+              "retry_wait"
+            ]
+          }
+        }
+      },
+      "EmailSummary": {
+        "type": "object",
+        "required": [
+          "id",
+          "source",
+          "subject",
+          "receivedAt",
+          "localIsRead"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "temporary",
+              "gmail",
+              "outlook"
+            ]
+          },
+          "subject": {
+            "type": "string"
+          },
+          "from": {
+            "type": "string"
+          },
+          "receivedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "localIsRead": {
+            "type": "boolean"
+          },
+          "hasAttachments": {
+            "type": "boolean"
+          },
+          "hasVerificationCandidate": {
+            "type": "boolean"
+          }
+        }
+      },
+      "MailboxCreate": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ttlMinutes"
+        ],
+        "properties": {
+          "ttlMinutes": {
+            "type": "integer",
+            "enum": [
+              10,
+              30,
+              60,
+              1440
+            ]
+          }
+        }
+      }
+    }
+  },
+  "security": [
+    {
+      "AccessAssertion": []
+    }
+  ],
+  "paths": {
+    "/me": {
+      "get": {
+        "summary": "Current owner and serverTime",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Response detail to be finalized from v2 specification."
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Business or authorization error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/mailboxes": {
+      "get": {
+        "summary": "Owned temporary mailboxes",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Response detail to be finalized from v2 specification."
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Business or authorization error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create temporary mailbox",
+        "responses": {
+          "201": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Response detail to be finalized from v2 specification."
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Business or authorization error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 16,
+              "maxLength": 128
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MailboxCreate"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/mailboxes/{id}/renew": {
+      "post": {
+        "summary": "Renew active mailbox; never resurrect expired address",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Response detail to be finalized from v2 specification."
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Business or authorization error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "extendMinutes": {
+                    "type": "integer",
+                    "enum": [
+                      60
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/mailboxes/{id}": {
+      "delete": {
+        "summary": "Immediately disable access; durable cleanup follows",
+        "responses": {
+          "202": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobAccepted"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Business or authorization error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/emails": {
+      "get": {
+        "summary": "Metadata-only cursor page; never includes OTP value or body",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "items",
+                    "nextCursor",
+                    "serverTime"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/EmailSummary"
+                      }
+                    },
+                    "nextCursor": {
+                      "type": "string",
+                      "nullable": true
+                    },
+                    "serverTime": {
+                      "type": "string",
+                      "format": "date-time"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Business or authorization error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "source",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "all",
+                "temporary",
+                "gmail",
+                "outlook"
+              ],
+              "default": "all"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 30
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "maxLength": 2048
+            }
+          },
+          {
+            "name": "mailboxId",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "maxLength": 256
+            }
+          },
+          {
+            "name": "accountId",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "maxLength": 256
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "maxLength": 256
+            }
+          },
+          {
+            "name": "unread",
+            "in": "query",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ]
+      }
+    },
+    "/emails/{id}": {
+      "get": {
+        "summary": "Owned ready message detail; check parent expiry",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Response detail to be finalized from v2 specification."
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Business or authorization error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      },
+      "patch": {
+        "summary": "Change MailHub local read state only",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Response detail to be finalized from v2 specification."
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Business or authorization error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "localIsRead"
+                ],
+                "properties": {
+                  "localIsRead": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/emails/{id}/html": {
+      "get": {
+        "summary": "Sanitized CSP-protected HTML; sandbox frame only",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Business or authorization error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/emails/{id}/attachments/{attachmentId}": {
+      "get": {
+        "summary": "Authorized download; verify both ownership links and expiry",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Business or authorization error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "attachmentId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/accounts": {
+      "get": {
+        "summary": "Owned provider accounts and separate auth/sync statuses",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Response detail to be finalized from v2 specification."
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Business or authorization error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/accounts/gmail/connect": {
+      "post": {
+        "summary": "Create one-time session-bound OAuth state; returns authorization URL",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Response detail to be finalized from v2 specification."
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Business or authorization error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false
+              }
+            }
+          }
+        }
+      }
+    },
+    "/oauth/gmail/callback": {
+      "get": {
+        "summary": "Atomically consume state, exchange code server-side, then redirect",
+        "responses": {
+          "303": {
+            "description": "Redirect to clean accounts URL; never return tokens to browser",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Business or authorization error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "code",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "error",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/accounts/{id}/sync": {
+      "post": {
+        "summary": "Coalesced durable sync request, not completed sync",
+        "responses": {
+          "202": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobAccepted"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Business or authorization error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/accounts/{id}": {
+      "delete": {
+        "summary": "Disable access, revoke grant and clear local cache; keep remote email",
+        "responses": {
+          "202": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobAccepted"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Business or authorization error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/jobs": {
+      "get": {
+        "summary": "Owner-scoped redacted jobs",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Response detail to be finalized from v2 specification."
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Business or authorization error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/jobs/{id}": {
+      "get": {
+        "summary": "Owner-scoped job progress",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Response detail to be finalized from v2 specification."
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Business or authorization error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/jobs/{id}/retry": {
+      "post": {
+        "summary": "Retry eligible job within policy",
+        "responses": {
+          "202": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobAccepted"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Business or authorization error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/settings": {
+      "get": {
+        "summary": "Versioned owner settings",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Response detail to be finalized from v2 specification."
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Business or authorization error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "summary": "Update versioned settings; validate retention/TTL server-side",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Response detail to be finalized from v2 specification."
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Business or authorization error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "version",
+                  "settings"
+                ],
+                "properties": {
+                  "version": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "settings": {
+                    "type": "object"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
