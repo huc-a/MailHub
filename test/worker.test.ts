@@ -160,6 +160,16 @@ describe('Worker API foundation', () => {
     const response=await worker.fetch(new Request('https://mailhub.test/api/v1/accounts/gmail/status',{headers:{'X-MailHub-Local-Subject':'owner'}}),env({APP_ENV:'local',ALLOW_LOCAL_AUTH:'true',APP_BASE_URL:'https://mailhub.test',DB:db as unknown as Env['DB']}));
     expect(response.status).toBe(200);expect(await response.json()).toEqual({configured:false,missingSecrets:['GOOGLE_CLIENT_ID','GOOGLE_CLIENT_SECRET','TOKEN_ENCRYPTION_KEY'],redirectUri:'https://mailhub.test/oauth/gmail/callback'});
   });
+  it('requires encrypted credential storage before allowing forwarded IMAP setup', async () => {
+    const db={prepare:()=>({bind:()=>({first:async()=>({id:'owner-1'}),all:async()=>({results:[]}),run:async()=>({meta:{changes:0}})})}),batch:async()=>[]};
+    const response=await worker.fetch(new Request('http://localhost/api/v1/accounts/forwarded-imap',{method:'POST',headers:{Origin:'http://localhost','Content-Type':'application/json','X-MailHub-Local-Subject':'owner'},body:JSON.stringify({provider:'qq',emailAddress:'hub@example.test',appPassword:'12345678',folders:['INBOX']})}),env({APP_ENV:'local',ALLOW_LOCAL_AUTH:'true',DB:db as unknown as Env['DB']}));
+    expect(response.status).toBe(503);expect(await response.json()).toMatchObject({error:{code:'IMAP_ENCRYPTION_NOT_CONFIGURED'}});
+  });
+  it('rejects arbitrary IMAP hosts before making an outbound connection', async () => {
+    const db={prepare:()=>({bind:()=>({first:async()=>({id:'owner-1'}),all:async()=>({results:[]}),run:async()=>({meta:{changes:0}})})}),batch:async()=>[]};
+    const response=await worker.fetch(new Request('http://localhost/api/v1/accounts/forwarded-imap',{method:'POST',headers:{Origin:'http://localhost','Content-Type':'application/json','X-MailHub-Local-Subject':'owner'},body:JSON.stringify({provider:'custom',emailAddress:'hub@example.test',appPassword:'12345678',folders:['INBOX']})}),env({APP_ENV:'local',ALLOW_LOCAL_AUTH:'true',TOKEN_ENCRYPTION_KEY:btoa('k'.repeat(32)),DB:db as unknown as Env['DB']}));
+    expect(response.status).toBe(400);expect(await response.json()).toMatchObject({error:{code:'INVALID_IMAP_PROVIDER'}});
+  });
   it('queues an owner-scoped Gmail sync and returns the durable job identity', async () => {
     const db={prepare:(sql:string)=>({bind:(..._values:unknown[])=>({sql,first:async<T,>()=>(sql.includes('FROM provider_accounts')?{id:'123e4567-e89b-42d3-a456-426614174000',auth_status:'connected',sync_status:'idle'}:sql.includes('FROM jobs')?{id:'job-sync-1',status:'pending'}:{id:'owner-1'}) as T,all:async()=>({results:[]}),run:async()=>({meta:{changes:1}})})}),batch:async()=>[]};
     const response=await worker.fetch(new Request('http://localhost/api/v1/accounts/123e4567-e89b-42d3-a456-426614174000/sync',{method:'POST',headers:{Origin:'http://localhost','X-MailHub-Local-Subject':'owner'}}),env({APP_ENV:'local',ALLOW_LOCAL_AUTH:'true',DB:db as unknown as Env['DB']}));
