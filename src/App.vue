@@ -4,7 +4,9 @@ import { computed, onMounted, onUnmounted, ref } from 'vue';
 type Mailbox = { id:string; address:string; status:'active'|'expired'|'deleting'; createdAt:number; expiresAt:number };
 type Email = { id:string; mailboxId:string|null; from:string; subject:string; snippet:string; receivedAt:number; localIsRead:number; source:string };
 type Detail = Email & { text:string; otpCandidates:string[]; bodyTruncated:boolean; hasHtml:boolean; attachments:Array<{id:string;filename:string;size:number;skippedReason:string|null}> };
+type Account = { id:string;provider:string;emailAddress:string;authStatus:string;syncStatus:string };
 const mailboxes=ref<Mailbox[]>([]), emails=ref<Email[]>([]), selectedMailbox=ref(''), selectedEmail=ref<Detail|null>(null);
+const accounts=ref<Account[]>([]);
 const busy=ref(false), loading=ref(true), error=ref(''), notice=ref(''), health=ref('checking');
 const visibleEmails=computed(()=>selectedMailbox.value?emails.value.filter(e=>e.mailboxId===selectedMailbox.value):emails.value);
 let refreshTimer:number|undefined;
@@ -15,18 +17,19 @@ async function api<T>(path:string, init:RequestInit={}):Promise<T>{
 }
 async function reload(){
   error.value='';
-  try { const [m,e]=await Promise.all([api<{mailboxes:Mailbox[]}>('/api/v1/mailboxes'),api<{emails:Email[]}>('/api/v1/emails?limit=100')]); mailboxes.value=m.mailboxes; emails.value=e.emails; health.value='ready'; }
+  try { const [m,e,a]=await Promise.all([api<{mailboxes:Mailbox[]}>('/api/v1/mailboxes'),api<{emails:Email[]}>('/api/v1/emails?limit=100'),api<{accounts:Account[]}>('/api/v1/accounts')]); mailboxes.value=m.mailboxes; emails.value=e.emails;accounts.value=a.accounts; health.value='ready'; }
   catch(e){health.value='error';error.value=e instanceof Error?e.message:'无法连接服务';}
   finally{loading.value=false;}
 }
 async function createMailbox(){busy.value=true;error.value='';notice.value='';try{const result=await api<{mailbox:Mailbox}>('/api/v1/mailboxes',{method:'POST',headers:{Origin:location.origin,'Idempotency-Key':crypto.randomUUID()},body:JSON.stringify({ttlMinutes:60})});await reload();selectedMailbox.value=result.mailbox.id;notice.value='临时邮箱已创建';}catch(e){error.value=e instanceof Error?e.message:'创建失败';}finally{busy.value=false;}}
+async function connectGmail(){busy.value=true;error.value='';try{const result=await api<{authorizationUrl:string}>('/api/v1/accounts/gmail/connect',{method:'POST',headers:{Origin:location.origin},body:'{}'});location.assign(result.authorizationUrl);}catch(e){error.value=e instanceof Error?e.message:'无法连接 Gmail';busy.value=false;}}
 async function renewMailbox(box:Mailbox){busy.value=true;error.value='';try{await api(`/api/v1/mailboxes/${box.id}/renew`,{method:'POST',headers:{Origin:location.origin},body:JSON.stringify({ttlMinutes:60})});await reload();notice.value='邮箱有效期已延长';}catch(e){error.value=e instanceof Error?e.message:'续期失败';}finally{busy.value=false;}}
 async function deleteMailbox(box:Mailbox){busy.value=true;error.value='';try{await api(`/api/v1/mailboxes/${box.id}`,{method:'DELETE',headers:{Origin:location.origin}});selectedMailbox.value='';selectedEmail.value=null;await reload();notice.value='邮箱已停用，清理任务已排队';}catch(e){error.value=e instanceof Error?e.message:'删除失败';}finally{busy.value=false;}}
 async function openEmail(item:Email){error.value='';try{const result=await api<{email:Detail}>(`/api/v1/emails/${item.id}`);selectedEmail.value=result.email;if(!item.localIsRead){await api(`/api/v1/emails/${item.id}`,{method:'PATCH',headers:{Origin:location.origin},body:JSON.stringify({localIsRead:true})});item.localIsRead=1;}}catch(e){error.value=e instanceof Error?e.message:'无法打开邮件';}}
 function copyAddress(value:string){navigator.clipboard.writeText(value).then(()=>notice.value='邮箱地址已复制').catch(()=>error.value='复制失败，请手动复制');}
 function expiry(value:number){const delta=Math.max(0,value-Date.now());if(delta===0)return'已过期';const mins=Math.ceil(delta/60000);return mins<60?`${mins} 分钟后过期`:`${Math.floor(mins/60)} 小时 ${mins%60} 分钟后过期`;}
 function date(value:number){return new Date(value).toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'});}
-onMounted(async()=>{await reload();refreshTimer=window.setInterval(reload,20000);});onUnmounted(()=>{if(refreshTimer)clearInterval(refreshTimer);});
+onMounted(async()=>{const result=new URLSearchParams(location.search).get('gmail');if(result){notice.value=result==='connected'?'Gmail 已连接；当前版本尚未开始同步。':result==='cancelled'?'已取消 Gmail 授权。':'Gmail 授权未完成。';history.replaceState({},'',location.pathname);}await reload();refreshTimer=window.setInterval(reload,20000);});onUnmounted(()=>{if(refreshTimer)clearInterval(refreshTimer);});
 </script>
 
 <template>
@@ -55,6 +58,8 @@ onMounted(async()=>{await reload();refreshTimer=window.setInterval(reload,20000)
         </article></section>
       </template>
       <template v-else>
+        <section v-if="accounts.length===0" class="connect-card"><div class="connect-mark">G</div><div class="connect-copy"><strong>连接 Gmail</strong><span>授权只读访问你的 Gmail 收件箱。当前实现已完成授权流程，邮件同步仍在开发中。</span></div><button class="secondary" :disabled="busy" @click="connectGmail">连接账号</button></section>
+        <section v-for="account in accounts" :key="account.id" class="connect-card"><div class="connect-mark">G</div><div class="connect-copy"><strong>{{ account.emailAddress }}</strong><span>Gmail · {{ account.authStatus==='connected'?'已授权只读访问':account.authStatus }}</span></div><span class="source-tag">{{ account.syncStatus==='idle'?'等待同步':'同步 '+account.syncStatus }}</span></section>
         <section class="page-heading"><div><p class="eyebrow">MAIL WORKSPACE</p><h1>收件箱</h1><p>管理临时地址，集中查看收到的邮件。</p></div><button class="primary" :disabled="busy" @click="createMailbox"><span>＋</span> 创建临时邮箱</button></section>
         <template v-if="selectedMailbox"><section v-for="box in mailboxes.filter(b=>b.id===selectedMailbox)" :key="box.id" class="mailbox-card"><div class="box-icon">✉</div><div class="box-main"><span class="box-caption">当前临时邮箱</span><div class="box-address">{{ box.address }} <button class="copy-btn" @click="copyAddress(box.address)">复制</button></div><span class="box-expiry" :class="box.status">{{ expiry(box.expiresAt) }}</span></div><div class="box-actions"><button class="secondary" :disabled="busy||box.status!=='active'" @click="renewMailbox(box)">延长 60 分钟</button><button class="danger-quiet" :disabled="busy" @click="deleteMailbox(box)">删除</button></div></section></template>
         <section class="inbox-card"><div class="list-heading"><div><h2>邮件</h2><span>{{ visibleEmails.length }} 封</span></div><button class="text-action" @click="selectedMailbox=''">{{ selectedMailbox?'查看全部':'' }}</button></div>

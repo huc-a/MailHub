@@ -67,5 +67,16 @@ describe('Worker API foundation', () => {
     expect(deleted).toEqual(['mail/box-1/message-1/text']);
     expect(sqls).toContain('cleanup-batch');
   });
+  it('creates a one-time Gmail OAuth URL with readonly scope and PKCE', async () => {
+    let storedSql='';
+    const db = { prepare: (sql: string) => ({ bind: (..._values: unknown[]) => ({ first: async () => ({id:'owner-1'}), all: async () => ({results:[]}), run: async () => { storedSql=sql; return {meta:{changes:1}}; } }) }), batch: async () => [] };
+    const response = await worker.fetch(new Request('http://localhost/api/v1/accounts/gmail/connect',{method:'POST',headers:{Origin:'http://localhost','Content-Type':'application/json','X-MailHub-Local-Subject':'owner'},body:'{}'}),env({APP_ENV:'local',ALLOW_LOCAL_AUTH:'true',APP_BASE_URL:'http://localhost',GOOGLE_CLIENT_ID:'client-id',TOKEN_ENCRYPTION_KEY:btoa('x'.repeat(32)),DB:db as unknown as Env['DB']}));
+    const body=await response.json() as {authorizationUrl:string}; const url=new URL(body.authorizationUrl);
+    expect(response.status).toBe(200);
+    expect(url.searchParams.get('scope')).toBe('https://www.googleapis.com/auth/gmail.readonly');
+    expect(url.searchParams.get('code_challenge_method')).toBe('S256');
+    expect(url.searchParams.get('code_challenge')).toHaveLength(43);
+    expect(storedSql).toContain('INSERT INTO oauth_states');
+  });
 });
 

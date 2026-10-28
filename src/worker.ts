@@ -1,6 +1,7 @@
 import { accessSubject } from './access';
 import { MIME_LIMITS, parseMime, type ParsedAttachment } from './ingestion/mime';
 import { sanitizeEmailHtml } from './security/sanitize-html';
+import { decryptSecret, encryptSecret, randomSecret, sha256Hex } from './security/crypto';
 export interface Env {
   DB: { prepare(query: string): { bind(...values: unknown[]): { first<T>(): Promise<T | null>; all<T>(): Promise<{results?: T[]}>; run(): Promise<{meta?: {changes?: number}}> } }; batch(statements: unknown[]): Promise<unknown[]> };
   MAIL_OBJECTS: { put(key: string, value: ArrayBuffer | ArrayBufferView | string, options?: { httpMetadata?: { contentType?: string } }): Promise<unknown>; get(key: string): Promise<{text(): Promise<string>; arrayBuffer(): Promise<ArrayBuffer>} | null>; delete(keys: string | string[]): Promise<unknown> };
@@ -10,10 +11,16 @@ export interface Env {
   ACCESS_TEAM_DOMAIN?: string;
   ACCESS_AUD?: string;
   ALLOW_LOCAL_AUTH?: string;
+  APP_BASE_URL?: string;
+  GOOGLE_CLIENT_ID?: string;
+  GOOGLE_CLIENT_SECRET?: string;
+  TOKEN_ENCRYPTION_KEY?: string;
+  TOKEN_KEY_VERSION?: string;
 }
 const json = (data: unknown, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
 const error = (code: string, message: string, status: number) => json({ error: { code, message, retryable: status >= 500, requestId: crypto.randomUUID() } }, status);
 const digest = async (value: string) => [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)))].map(x => x.toString(16).padStart(2, '0')).join('');
+function base64UrlFromHex(hex: string) { const bytes=new Uint8Array(hex.match(/.{2}/g)?.map(pair=>parseInt(pair,16))??[]);let binary='';for(const byte of bytes)binary+=String.fromCharCode(byte);return btoa(binary).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
 const localPart = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), x => 'abcdefghijklmnopqrstuvwxyz234567'[x & 31]).join('');
 const sha256 = async (bytes: Uint8Array) => { const copy = new Uint8Array(bytes); return [...new Uint8Array(await crypto.subtle.digest('SHA-256', copy.buffer as ArrayBuffer))].map(x => x.toString(16).padStart(2, '0')).join(''); };
 const sameOrigin = (request: Request) => request.headers.get('Origin') === new URL(request.url).origin;
@@ -38,6 +45,37 @@ async function readRaw(stream: ReadableStream<Uint8Array>, declaredSize: number)
   return raw;
 }
 function attachmentSize(attachment: ParsedAttachment) { return attachment.skippedReason === null ? attachment.bytes.byteLength : attachment.size; }
+
+function oauthRedirect(env: Env, result: string) {
+  const base = env.APP_BASE_URL;
+  if (!base) throw new Error('APP_BASE_URL is not configured');
+  return new Response(null,{status:303,headers:{Location:`${base.replace(/\/$/,'')}/settings?gmail=${encodeURIComponent(result)}`,'Cache-Control':'no-store','Referrer-Policy':'no-referrer'}});
+}
+async function completeGoogleOAuth(request: Request, env: Env, owner: string) {
+  const url=new URL(request.url), state=url.searchParams.get('state'), code=url.searchParams.get('code');
+  if(url.searchParams.has('error')) return oauthRedirect(env,'cancelled');
+  if(!state||!code||!env.TOKEN_ENCRYPTION_KEY||!env.GOOGLE_CLIENT_ID||!env.GOOGLE_CLIENT_SECRET||!env.APP_BASE_URL) return error('OAUTH_NOT_CONFIGURED','Google OAuth is not configured or callback is invalid',400);
+  const stateHash=await sha256Hex(state), now=Date.now();
+  const record=await env.DB.prepare('UPDATE oauth_states SET consumed_at_ms=? WHERE state_hash=? AND user_id=? AND provider=\'gmail\' AND consumed_at_ms IS NULL AND expires_at_ms>? RETURNING encrypted_code_verifier,key_version,session_binding_hash').bind(now,stateHash,owner,now).first<{encrypted_code_verifier:string;key_version:string;session_binding_hash:string}>();
+  if(!record||record.session_binding_hash!==await sha256Hex(owner)) return error('OAUTH_STATE_INVALID','Authorization state is invalid, expired or already used',400);
+  const verifier=await decryptSecret(record.encrypted_code_verifier,env.TOKEN_ENCRYPTION_KEY,`oauth-state:${stateHash}`);
+  const redirectUri=`${env.APP_BASE_URL.replace(/\/$/,'')}/oauth/gmail/callback`;
+  const tokenResponse=await fetch('https://oauth2.googleapis.com/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({client_id:env.GOOGLE_CLIENT_ID,client_secret:env.GOOGLE_CLIENT_SECRET,code,code_verifier:verifier,grant_type:'authorization_code',redirect_uri:redirectUri})});
+  if(!tokenResponse.ok) return error('OAUTH_EXCHANGE_FAILED','Google authorization could not be completed',502);
+  const tokens=await tokenResponse.json() as {access_token?:string;refresh_token?:string;scope?:string;token_type?:string};
+  if(!tokens.access_token) return error('OAUTH_TOKEN_MISSING','Google did not return an access token',502);
+  const profileResponse=await fetch('https://gmail.googleapis.com/gmail/v1/users/me/profile',{headers:{Authorization:`Bearer ${tokens.access_token}`}});
+  if(!profileResponse.ok) return error('GMAIL_PROFILE_FAILED','Could not read the authorized Gmail profile',502);
+  const profile=await profileResponse.json() as {emailAddress?:string};
+  if(!profile.emailAddress||!tokens.scope?.split(' ').includes('https://www.googleapis.com/auth/gmail.readonly')) return error('GMAIL_SCOPE_MISSING','The Gmail read-only permission was not granted',403);
+  const existing=await env.DB.prepare("SELECT id,encrypted_refresh_token,key_version FROM provider_accounts WHERE user_id=? AND provider='gmail' AND provider_subject=?").bind(owner,profile.emailAddress).first<{id:string;encrypted_refresh_token:string|null;key_version:string|null}>();
+  const accountId=existing?.id??crypto.randomUUID(), version=env.TOKEN_KEY_VERSION??'v1';
+  const refresh=tokens.refresh_token?await encryptSecret(tokens.refresh_token,env.TOKEN_ENCRYPTION_KEY,`provider-account:${owner}:${accountId}:gmail`):existing?.encrypted_refresh_token;
+  const tokenVersion=tokens.refresh_token?version:existing?.key_version;
+  if(!refresh||!tokenVersion) return error('GMAIL_REAUTH_REQUIRED','Google did not provide a refresh token; disconnect and reconnect the account',409);
+  await env.DB.prepare("INSERT INTO provider_accounts(id,user_id,provider,provider_subject,email_address,auth_status,encrypted_refresh_token,key_version,granted_scopes_json,created_at_ms) VALUES(?,?,'gmail',?,?,'connected',?,?,?,?) ON CONFLICT(user_id,provider,provider_subject) DO UPDATE SET email_address=excluded.email_address,auth_status='connected',encrypted_refresh_token=excluded.encrypted_refresh_token,key_version=excluded.key_version,granted_scopes_json=excluded.granted_scopes_json").bind(accountId,owner,profile.emailAddress,profile.emailAddress,refresh,tokenVersion,JSON.stringify(tokens.scope.split(' ')),now).run();
+  return oauthRedirect(env,'connected');
+}
 
 async function ingestInbound(message: { to: string; raw: ReadableStream<Uint8Array>; rawSize: number; setReject(reason: string): void }, env: Env) {
   const mailbox = await env.DB.prepare("SELECT id,user_id,generation FROM mailboxes WHERE address=? COLLATE NOCASE AND status='active' AND expires_at_ms>? ").bind(message.to.toLowerCase(),Date.now()).first<{id:string;user_id:string;generation:number}>();
@@ -134,11 +172,34 @@ async function ownerId(request: Request, env: Env): Promise<string | null> {
 const worker = {
   async fetch(request: Request, env: Env) {
     const url = new URL(request.url);
+    if(url.pathname==='/oauth/gmail/callback'&&request.method==='GET'){
+      const owner=await ownerId(request,env);
+      if(!owner)return error('UNAUTHENTICATED','Access authentication required',401);
+      return completeGoogleOAuth(request,env,owner);
+    }
     if (!url.pathname.startsWith('/api/')) return env.ASSETS.fetch(request);
     if (url.pathname === '/api/v1/health' && request.method === 'GET') return json({ ok: true, service: 'mailhub', environment: env.APP_ENV });
     const owner = await ownerId(request, env);
     if (!owner) return error('UNAUTHENTICATED', 'Access authentication required', 401);
     if (url.pathname === '/api/v1/me' && request.method === 'GET') return json({ id: owner });
+    if(url.pathname==='/api/v1/accounts'&&request.method==='GET'){
+      const result=await env.DB.prepare('SELECT id,provider,email_address AS emailAddress,auth_status AS authStatus,sync_status AS syncStatus,last_synced_at_ms AS lastSyncedAt FROM provider_accounts WHERE user_id=? ORDER BY created_at_ms DESC').bind(owner).all<Record<string,unknown>>();
+      return json({accounts:result.results??[]});
+    }
+    if(url.pathname==='/api/v1/accounts/gmail/connect'&&request.method==='POST'){
+      if(!sameOrigin(request))return error('CSRF_REJECTED','Same-origin request required',403);
+      if(!validJson(request))return error('UNSUPPORTED_MEDIA_TYPE','Content-Type must be application/json',415);
+      if(!env.APP_BASE_URL||!env.GOOGLE_CLIENT_ID||!env.TOKEN_ENCRYPTION_KEY)return error('OAUTH_NOT_CONFIGURED','Google OAuth settings are missing',503);
+      let base:URL;try{base=new URL(env.APP_BASE_URL);}catch{return error('OAUTH_CONFIG_INVALID','APP_BASE_URL must be an absolute URL',500);}
+      if((env.APP_ENV!=='local'&&base.protocol!=='https:')||base.search||base.hash)return error('OAUTH_CONFIG_INVALID','APP_BASE_URL must be a clean HTTPS base URL',500);
+      const state=randomSecret(32),verifier=randomSecret(48),stateHash=await sha256Hex(state),version=env.TOKEN_KEY_VERSION??'v1';
+      const encryptedVerifier=await encryptSecret(verifier,env.TOKEN_ENCRYPTION_KEY,`oauth-state:${stateHash}`), now=Date.now();
+      await env.DB.prepare("INSERT INTO oauth_states(state_hash,user_id,provider,session_binding_hash,encrypted_code_verifier,key_version,expires_at_ms) VALUES(?,?,'gmail',?,?,?,?)").bind(stateHash,owner,await sha256Hex(owner),encryptedVerifier,version,now+10*60_000).run();
+      const challenge=await sha256Hex(verifier);
+      const authorization=new URL('https://accounts.google.com/o/oauth2/v2/auth');
+      authorization.search=new URLSearchParams({client_id:env.GOOGLE_CLIENT_ID,redirect_uri:`${base.origin}${base.pathname.replace(/\/$/,'')}/oauth/gmail/callback`,response_type:'code',scope:'https://www.googleapis.com/auth/gmail.readonly',access_type:'offline',prompt:'consent',include_granted_scopes:'true',state,code_challenge:base64UrlFromHex(challenge),code_challenge_method:'S256'}).toString();
+      return json({authorizationUrl:authorization.toString()});
+    }
     if (url.pathname === '/api/v1/mailboxes' && request.method === 'GET') {
       const result = await env.DB.prepare("SELECT id,address,CASE WHEN status='active' AND expires_at_ms<=? THEN 'expired' ELSE status END AS status,created_at_ms AS createdAt,expires_at_ms AS expiresAt FROM mailboxes WHERE user_id=? AND status IN ('active','expired') ORDER BY created_at_ms DESC LIMIT 100").bind(Date.now(),owner).all<Record<string, unknown>>();
       return json({ mailboxes: result.results ?? [] });

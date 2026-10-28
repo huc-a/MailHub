@@ -1,3 +1,5 @@
 APP_ENV=local
 ALLOW_LOCAL_AUTH=true
 MAIL_DOMAIN=inbox.example.invalid
+APP_BASE_URL=http://localhost:8787
+# Add Google OAuth settings and a base64 encoded 32-byte TOKEN_ENCRYPTION_KEY for Gmail testing.
