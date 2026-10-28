@@ -38,4 +38,20 @@ describe('Worker API foundation', () => {
     expect(bindValues[0]).toBe('owner-1');
     expect(await response.json()).toMatchObject({ emails: [{ id: 'mail-1' }] });
   });
+  it('stages and stores an accepted inbound message before making it ready', async () => {
+    const statements: string[] = [], objects: string[] = [];
+    const db = {
+      prepare: (sql: string) => ({ bind: (..._values: unknown[]) => ({
+        first: async <T,>() => (sql.includes('FROM mailboxes WHERE address=') ? { id: 'mb-1', user_id: 'owner-1', generation: 0 } : null) as T | null,
+        all: async <T,>() => ({ results: [] as T[] }),
+        run: async () => { statements.push(sql); return { meta: { changes: 1 } }; },
+      }) }),
+      batch: async (_batch: unknown[]) => { statements.push('staged-batch'); return []; },
+    };
+    const raw = new TextEncoder().encode('From: sender@example.net\r\nTo: temp@mail.test\r\nSubject: Test\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nYour code is 123456');
+    await worker.email({ to: 'temp@mail.test', raw: new ReadableStream({ start(controller) { controller.enqueue(raw); controller.close(); } }), rawSize: raw.byteLength, setReject: reason => { throw new Error(reason); } }, env({ DB: db as unknown as Env['DB'], MAIL_OBJECTS: { put: async (key: string) => { objects.push(key); } } as unknown as Env['MAIL_OBJECTS'] }));
+    expect(objects).toHaveLength(1);
+    expect(statements.some(sql => sql.includes("SET ingest_status='ready'"))).toBe(true);
+  });
 });
+

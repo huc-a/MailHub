@@ -1,7 +1,8 @@
 import { accessSubject } from './access';
+import { MIME_LIMITS, parseMime, type ParsedAttachment } from './ingestion/mime';
 export interface Env {
   DB: { prepare(query: string): { bind(...values: unknown[]): { first<T>(): Promise<T | null>; all<T>(): Promise<{results?: T[]}>; run(): Promise<{meta?: {changes?: number}}> } }; batch(statements: unknown[]): Promise<unknown[]> };
-  MAIL_OBJECTS: unknown;
+  MAIL_OBJECTS: { put(key: string, value: ArrayBuffer | ArrayBufferView | string, options?: { httpMetadata?: { contentType?: string } }): Promise<unknown> };
   ASSETS: { fetch(request: Request): Promise<Response> };
   APP_ENV: string;
   MAIL_DOMAIN: string;
@@ -13,8 +14,67 @@ const json = (data: unknown, status = 200) => Response.json(data, { status, head
 const error = (code: string, message: string, status: number) => json({ error: { code, message, retryable: status >= 500, requestId: crypto.randomUUID() } }, status);
 const digest = async (value: string) => [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)))].map(x => x.toString(16).padStart(2, '0')).join('');
 const localPart = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), x => 'abcdefghijklmnopqrstuvwxyz234567'[x & 31]).join('');
+const sha256 = async (bytes: Uint8Array) => { const copy = new Uint8Array(bytes); return [...new Uint8Array(await crypto.subtle.digest('SHA-256', copy.buffer as ArrayBuffer))].map(x => x.toString(16).padStart(2, '0')).join(''); };
 const sameOrigin = (request: Request) => request.headers.get('Origin') === new URL(request.url).origin;
 const validJson = (request: Request) => request.headers.get('Content-Type')?.split(';')[0].trim().toLowerCase() === 'application/json';
+
+async function readRaw(stream: ReadableStream<Uint8Array>, declaredSize: number): Promise<Uint8Array> {
+  if (declaredSize > MIME_LIMITS.raw) throw new Error('RAW_MESSAGE_TOO_LARGE');
+  const reader = stream.getReader(), chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MIME_LIMITS.raw) { await reader.cancel(); throw new Error('RAW_MESSAGE_TOO_LARGE'); }
+      chunks.push(value);
+    }
+  } finally { reader.releaseLock(); }
+  const raw = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) { raw.set(chunk, offset); offset += chunk.byteLength; }
+  return raw;
+}
+function attachmentSize(attachment: ParsedAttachment) { return attachment.skippedReason === null ? attachment.bytes.byteLength : attachment.size; }
+
+async function ingestInbound(message: { to: string; raw: ReadableStream<Uint8Array>; rawSize: number; setReject(reason: string): void }, env: Env) {
+  const mailbox = await env.DB.prepare("SELECT id,user_id,generation FROM mailboxes WHERE address=? COLLATE NOCASE AND status='active' AND expires_at_ms>? ").bind(message.to.toLowerCase(),Date.now()).first<{id:string;user_id:string;generation:number}>();
+  if (!mailbox) { message.setReject('Unknown or expired mailbox'); return; }
+  let raw: Uint8Array;
+  try { raw = await readRaw(message.raw,message.rawSize); }
+  catch (e) { if (e instanceof Error && e.message === 'RAW_MESSAGE_TOO_LARGE') { message.setReject('Message exceeds the application size limit'); return; } throw e; }
+  let parsed;
+  try { parsed = await parseMime(raw,message.to.toLowerCase()); }
+  catch { message.setReject('Message could not be parsed'); return; }
+  const dedup = await sha256(raw);
+  let email = await env.DB.prepare('SELECT id,ingest_status FROM emails WHERE mailbox_id=? AND provider_message_id=?').bind(mailbox.id,dedup).first<{id:string;ingest_status:string}>();
+  if (email?.ingest_status === 'ready') return;
+  const emailId = email?.id ?? crypto.randomUUID(), now = Date.now();
+  const objects: { id:string; key:string; kind:string; data:Uint8Array; contentType:string }[] = [];
+  if (parsed.text) objects.push({id:`${emailId}-text`,key:`mail/${mailbox.id}/${emailId}/text`,kind:'text',data:new TextEncoder().encode(parsed.text),contentType:'text/plain; charset=utf-8'});
+  if (parsed.html) objects.push({id:`${emailId}-html`,key:`mail/${mailbox.id}/${emailId}/html`,kind:'html',data:new TextEncoder().encode(parsed.html),contentType:'text/html; charset=utf-8'});
+  const statements = [env.DB.prepare("INSERT OR IGNORE INTO emails(id,user_id,source,mailbox_id,provider_message_id,message_id_header,from_address,to_addresses_json,subject,snippet,received_at_ms,created_at_ms,otp_candidates_json,ingest_status,source_generation,body_truncated) VALUES(?,?,'temporary',?,?,?,?,?,?,?,?,?,?,'staged',?,?)").bind(emailId,mailbox.user_id,mailbox.id,dedup,parsed.messageId,parsed.from,JSON.stringify(parsed.to),parsed.subject,parsed.snippet,parsed.receivedAt,now,JSON.stringify(parsed.otpCandidates),mailbox.generation,parsed.bodyTruncated ? 1 : 0)];
+  for (const [index,attachment] of parsed.attachments.entries()) {
+    const attachmentId = `${emailId}-att-${index}`;
+    if (attachment.skippedReason === null) {
+      const objectId = `${emailId}-attachment-${index}`, key = `mail/${mailbox.id}/${emailId}/attachment-${index}`;
+      objects.push({id:objectId,key,kind:'attachment',data:attachment.bytes,contentType:attachment.contentType});
+      statements.push(env.DB.prepare("INSERT OR IGNORE INTO mail_objects(id,email_id,kind,object_key,size_bytes,status,created_at_ms) VALUES(?,?, 'attachment', ?, ?, 'expected', ?)").bind(objectId,emailId,key,attachment.bytes.byteLength,now));
+      statements.push(env.DB.prepare('INSERT OR IGNORE INTO email_attachments(id,email_id,object_id,filename,content_type,size_bytes) VALUES(?,?,?,?,?,?)').bind(attachmentId,emailId,objectId,attachment.filename,attachment.contentType,attachment.bytes.byteLength));
+    } else {
+      statements.push(env.DB.prepare('INSERT OR IGNORE INTO email_attachments(id,email_id,object_id,filename,content_type,size_bytes,skipped_reason) VALUES(?,?,NULL,?,?,?,?)').bind(attachmentId,emailId,attachment.filename,attachment.contentType,attachmentSize(attachment),attachment.skippedReason));
+    }
+  }
+  for (const object of objects.filter(item => item.kind !== 'attachment')) statements.push(env.DB.prepare("INSERT OR IGNORE INTO mail_objects(id,email_id,kind,object_key,size_bytes,status,created_at_ms) VALUES(?,?,?,?,?,'expected',?)").bind(object.id,emailId,object.kind,object.key,object.data.byteLength,now));
+  await env.DB.batch(statements);
+  for (const object of objects) {
+    await env.MAIL_OBJECTS.put(object.key,object.data,{httpMetadata:{contentType:object.contentType}});
+    await env.DB.prepare("UPDATE mail_objects SET status='uploaded',checksum_sha256=? WHERE id=? AND email_id=?").bind(await sha256(object.data),object.id,emailId).run();
+  }
+  const finalized = await env.DB.prepare("UPDATE emails SET ingest_status='ready' WHERE id=? AND user_id=? AND ingest_status='staged' AND source_generation=(SELECT generation FROM mailboxes WHERE id=? AND status='active' AND expires_at_ms>?)").bind(emailId,mailbox.user_id,mailbox.id,Date.now()).run();
+  if ((finalized.meta?.changes ?? 0) !== 1) throw new Error('Mailbox changed during message ingestion');
+}
 
 async function ownerId(request: Request, env: Env): Promise<string | null> {
   let subject: string | null = null;
@@ -122,9 +182,8 @@ const worker = {
     }
     return error('NOT_FOUND', 'API route not found', 404);
   },
-  async email(message: { to: string; setReject(reason: string): void }, env: Env) {
-    const mailbox = await env.DB.prepare("SELECT id FROM mailboxes WHERE address=? COLLATE NOCASE AND status='active' AND expires_at_ms>?").bind(message.to.toLowerCase(),Date.now()).first<{id:string}>();
-    if (!mailbox) message.setReject('Unknown or expired mailbox');
+  async email(message: { to: string; raw: ReadableStream<Uint8Array>; rawSize: number; setReject(reason: string): void }, env: Env) {
+    await ingestInbound(message,env);
   },
 };
 export default worker;
