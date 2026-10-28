@@ -77,6 +77,7 @@ describe('Worker API foundation', () => {
     await worker.scheduled({}, env({ DB: db as unknown as Env['DB'], MAIL_OBJECTS: { delete: async (keys: string|string[]) => { deleted.push(...(Array.isArray(keys)?keys:[keys])); } } as unknown as Env['MAIL_OBJECTS'] }));
     expect(deleted).toEqual(['mail/box-1/message-1/text']);
     expect(sqls).toContain('cleanup-batch');
+    expect(sqls.some(sql=>sql.includes("status IN ('pending','retry_wait','running')"))).toBe(true);
   });
   it('creates a one-time Gmail OAuth URL with readonly scope and PKCE', async () => {
     let storedSql='';
