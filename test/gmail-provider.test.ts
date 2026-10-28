@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { getRawGmailMessage, GmailApiError, listInboxMessages, refreshGmailAccessToken } from '../src/providers/gmail';
+import { getRawGmailMessage, GmailApiError, listGmailHistory, listInboxMessages, refreshGmailAccessToken } from '../src/providers/gmail';
 
 afterEach(()=>vi.unstubAllGlobals());
 describe('Gmail readonly provider',()=>{
@@ -19,5 +19,10 @@ describe('Gmail readonly provider',()=>{
   it('refreshes access using readonly grant credentials',async()=>{
     let body='';vi.stubGlobal('fetch',vi.fn(async(_url:RequestInfo|URL,init?:RequestInit)=>{body=String(init?.body);return Response.json({access_token:'new',expires_in:3600});}));
     await expect(refreshGmailAccessToken('refresh','client','secret')).resolves.toMatchObject({access_token:'new'});expect(body).toContain('grant_type=refresh_token');
+  });
+  it('requests history changes needed to mirror Inbox membership and deletions',async()=>{
+    let called='';vi.stubGlobal('fetch',vi.fn(async(input:RequestInfo|URL)=>{called=String(input);return Response.json({historyId:'101',history:[]});}));
+    await listGmailHistory('access','99');const url=new URL(called);
+    expect(url.searchParams.getAll('historyTypes')).toEqual(['messageAdded','messageDeleted','labelAdded','labelRemoved']);
   });
 });

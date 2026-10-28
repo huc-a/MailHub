@@ -1,5 +1,6 @@
 ﻿export type GmailMessageRef = {id:string;threadId:string};
 export type GmailRawMessage = {id:string;threadId:string;historyId?:string;internalDate?:string;raw:string};
+export type GmailHistoryRecord = {id:string;messagesAdded?:{message:GmailMessageRef}[];messagesDeleted?:{message:GmailMessageRef}[];labelsAdded?:{message:GmailMessageRef;labelIds:string[]}[];labelsRemoved?:{message:GmailMessageRef;labelIds:string[]}[]};
 export class GmailApiError extends Error {
   constructor(public status:number,public retryAfter:string|null,public reason:string){super(`Gmail API ${status}: ${reason}`);}
 }
@@ -21,4 +22,11 @@ export async function listInboxMessages(accessToken:string,afterEpochSeconds:num
 export async function getRawGmailMessage(accessToken:string,id:string){
   const result=await googleJson<GmailRawMessage>(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(id)}?format=raw`,accessToken);
   const normalized=result.raw.replace(/-/g,'+').replace(/_/g,'/');const binary=atob(normalized+'='.repeat((4-normalized.length%4)%4));return {...result,bytes:Uint8Array.from(binary,c=>c.charCodeAt(0))};
+}
+export async function listGmailHistory(accessToken:string,startHistoryId:string,pageToken?:string){
+  const url=new URL('https://gmail.googleapis.com/gmail/v1/users/me/history');url.searchParams.set('startHistoryId',startHistoryId);for(const type of ['messageAdded','messageDeleted','labelAdded','labelRemoved'])url.searchParams.append('historyTypes',type);url.searchParams.set('maxResults','100');if(pageToken)url.searchParams.set('pageToken',pageToken);
+  return googleJson<{history?:GmailHistoryRecord[];historyId:string;nextPageToken?:string}>(url.toString(),accessToken);
+}
+export async function getGmailMessageLabels(accessToken:string,id:string){
+  return googleJson<{id:string;labelIds?:string[]}>(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(id)}?format=minimal`,accessToken);
 }
