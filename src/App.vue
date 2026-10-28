@@ -8,29 +8,35 @@ type Account = { id:string;provider:string;emailAddress:string;authStatus:string
 const mailboxes=ref<Mailbox[]>([]), emails=ref<Email[]>([]), selectedMailbox=ref(''), selectedEmail=ref<Detail|null>(null);
 const accounts=ref<Account[]>([]);
 const busy=ref(false), loading=ref(true), error=ref(''), notice=ref(''), health=ref('checking');
+const search=ref(''), sourceFilter=ref('all'), unreadFilter=ref('all'), nextCursor=ref<string|null>(null), loadingMore=ref(false);
 const visibleEmails=computed(()=>selectedMailbox.value?emails.value.filter(e=>e.mailboxId===selectedMailbox.value):emails.value);
-let refreshTimer:number|undefined;
+let refreshTimer:number|undefined, searchTimer:number|undefined, inboxRequestId=0;
 async function api<T>(path:string, init:RequestInit={}):Promise<T>{
   const headers=new Headers(init.headers); if(init.body)headers.set('Content-Type','application/json');
   const response=await fetch(path,{...init,headers}); const data=await response.json().catch(()=>({}));
   if(!response.ok)throw new Error(data?.error?.message??`请求失败 (${response.status})`); return data as T;
 }
+function emailListUrl(cursor?:string){const params=new URLSearchParams({limit:'100'});if(selectedMailbox.value)params.set('mailboxId',selectedMailbox.value);if(sourceFilter.value!=='all')params.set('source',sourceFilter.value);if(unreadFilter.value!=='all')params.set('unread',unreadFilter.value);if(search.value.trim())params.set('q',search.value.trim());if(cursor)params.set('cursor',cursor);return `/api/v1/emails?${params}`;}
 async function reload(){
+  const requestId=++inboxRequestId;loadingMore.value=false;
   error.value='';
-  try { const [m,e,a]=await Promise.all([api<{mailboxes:Mailbox[]}>('/api/v1/mailboxes'),api<{emails:Email[]}>('/api/v1/emails?limit=100'),api<{accounts:Account[]}>('/api/v1/accounts')]); mailboxes.value=m.mailboxes; emails.value=e.emails;accounts.value=a.accounts; health.value='ready'; }
-  catch(e){health.value='error';error.value=e instanceof Error?e.message:'无法连接服务';}
-  finally{loading.value=false;}
+  try { const [m,e,a]=await Promise.all([api<{mailboxes:Mailbox[]}>('/api/v1/mailboxes'),api<{emails:Email[];nextCursor:string|null}>(emailListUrl()),api<{accounts:Account[]}>('/api/v1/accounts')]);if(requestId!==inboxRequestId)return;mailboxes.value=m.mailboxes; emails.value=e.emails;nextCursor.value=e.nextCursor;accounts.value=a.accounts; health.value='ready'; }
+  catch(e){if(requestId!==inboxRequestId)return;health.value='error';error.value=e instanceof Error?e.message:'无法连接服务';}
+  finally{if(requestId===inboxRequestId)loading.value=false;}
 }
-async function createMailbox(){busy.value=true;error.value='';notice.value='';try{const result=await api<{mailbox:Mailbox}>('/api/v1/mailboxes',{method:'POST',headers:{Origin:location.origin,'Idempotency-Key':crypto.randomUUID()},body:JSON.stringify({ttlMinutes:60})});await reload();selectedMailbox.value=result.mailbox.id;notice.value='临时邮箱已创建';}catch(e){error.value=e instanceof Error?e.message:'创建失败';}finally{busy.value=false;}}
+async function loadMore(){if(!nextCursor.value||loadingMore.value)return;const cursor=nextCursor.value,requestId=++inboxRequestId;loadingMore.value=true;error.value='';try{const result=await api<{emails:Email[];nextCursor:string|null}>(emailListUrl(cursor));if(requestId!==inboxRequestId)return;emails.value=[...emails.value,...result.emails];nextCursor.value=result.nextCursor;}catch(e){if(requestId===inboxRequestId)error.value=e instanceof Error?e.message:'无法读取更多邮件';}finally{if(requestId===inboxRequestId)loadingMore.value=false;}}
+function searchChanged(){if(searchTimer)clearTimeout(searchTimer);searchTimer=window.setTimeout(()=>void reload(),300);}
+function filtersChanged(){void reload();}
+async function createMailbox(){busy.value=true;error.value='';notice.value='';try{const result=await api<{mailbox:Mailbox}>('/api/v1/mailboxes',{method:'POST',headers:{Origin:location.origin,'Idempotency-Key':crypto.randomUUID()},body:JSON.stringify({ttlMinutes:60})});selectedMailbox.value=result.mailbox.id;await reload();notice.value='临时邮箱已创建';}catch(e){error.value=e instanceof Error?e.message:'创建失败';}finally{busy.value=false;}}
 async function connectGmail(){busy.value=true;error.value='';try{const result=await api<{authorizationUrl:string}>('/api/v1/accounts/gmail/connect',{method:'POST',headers:{Origin:location.origin},body:'{}'});location.assign(result.authorizationUrl);}catch(e){error.value=e instanceof Error?e.message:'无法连接 Gmail';busy.value=false;}}
 async function syncGmail(account:Account){busy.value=true;error.value='';try{const result=await api<{status:string}>(`/api/v1/accounts/${account.id}/sync`,{method:'POST',headers:{Origin:location.origin}});notice.value=result.status==='running'?'Gmail 同步正在运行':'Gmail 同步任务已排队';await reload();}catch(e){error.value=e instanceof Error?e.message:'无法启动同步';}finally{busy.value=false;}}
 async function renewMailbox(box:Mailbox){busy.value=true;error.value='';try{await api(`/api/v1/mailboxes/${box.id}/renew`,{method:'POST',headers:{Origin:location.origin},body:JSON.stringify({ttlMinutes:60})});await reload();notice.value='邮箱有效期已延长';}catch(e){error.value=e instanceof Error?e.message:'续期失败';}finally{busy.value=false;}}
 async function deleteMailbox(box:Mailbox){busy.value=true;error.value='';try{await api(`/api/v1/mailboxes/${box.id}`,{method:'DELETE',headers:{Origin:location.origin}});selectedMailbox.value='';selectedEmail.value=null;await reload();notice.value='邮箱已停用，清理任务已排队';}catch(e){error.value=e instanceof Error?e.message:'删除失败';}finally{busy.value=false;}}
-async function openEmail(item:Email){error.value='';try{const result=await api<{email:Detail}>(`/api/v1/emails/${item.id}`);selectedEmail.value=result.email;if(!item.localIsRead){await api(`/api/v1/emails/${item.id}`,{method:'PATCH',headers:{Origin:location.origin},body:JSON.stringify({localIsRead:true})});item.localIsRead=1;}}catch(e){error.value=e instanceof Error?e.message:'无法打开邮件';}}
+async function openEmail(item:Email){error.value='';try{const result=await api<{email:Detail}>(`/api/v1/emails/${item.id}`);selectedEmail.value=result.email;if(!item.localIsRead){await api(`/api/v1/emails/${item.id}`,{method:'PATCH',headers:{Origin:location.origin},body:JSON.stringify({localIsRead:true})});item.localIsRead=1;if(unreadFilter.value==='true')emails.value=emails.value.filter(email=>email.id!==item.id);}}catch(e){error.value=e instanceof Error?e.message:'无法打开邮件';}}
 function copyAddress(value:string){navigator.clipboard.writeText(value).then(()=>notice.value='邮箱地址已复制').catch(()=>error.value='复制失败，请手动复制');}
 function expiry(value:number){const delta=Math.max(0,value-Date.now());if(delta===0)return'已过期';const mins=Math.ceil(delta/60000);return mins<60?`${mins} 分钟后过期`:`${Math.floor(mins/60)} 小时 ${mins%60} 分钟后过期`;}
 function date(value:number){return new Date(value).toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'});}
-onMounted(async()=>{const result=new URLSearchParams(location.search).get('gmail');if(result){notice.value=result==='connected'?'Gmail 已连接；当前版本尚未开始同步。':result==='cancelled'?'已取消 Gmail 授权。':'Gmail 授权未完成。';history.replaceState({},'',location.pathname);}await reload();refreshTimer=window.setInterval(reload,20000);});onUnmounted(()=>{if(refreshTimer)clearInterval(refreshTimer);});
+onMounted(async()=>{const result=new URLSearchParams(location.search).get('gmail');if(result){notice.value=result==='connected'?'Gmail 已连接；当前版本尚未开始同步。':result==='cancelled'?'已取消 Gmail 授权。':'Gmail 授权未完成。';history.replaceState({},'',location.pathname);}await reload();refreshTimer=window.setInterval(reload,20000);});onUnmounted(()=>{if(refreshTimer)clearInterval(refreshTimer);if(searchTimer)clearTimeout(searchTimer);});
 </script>
 
 <template>
@@ -40,7 +46,7 @@ onMounted(async()=>{const result=new URLSearchParams(location.search).get('gmail
       <div class="section-label">工作区</div>
       <button class="nav-item active"><span>▤</span> 收件箱 <span class="nav-count">{{ visibleEmails.length }}</span></button>
       <div class="section-label mailbox-heading"><span>临时邮箱</span><button class="icon-button" :disabled="busy" title="创建邮箱" @click="createMailbox">＋</button></div>
-      <button v-for="box in mailboxes" :key="box.id" class="mailbox-nav" :class="{selected:selectedMailbox===box.id}" @click="selectedMailbox=box.id;selectedEmail=null">
+      <button v-for="box in mailboxes" :key="box.id" class="mailbox-nav" :class="{selected:selectedMailbox===box.id}" @click="selectedMailbox=box.id;selectedEmail=null;reload()">
         <span class="mail-dot" :class="box.status"></span><span class="mail-address">{{ box.address.split('@')[0] }}</span><span class="mail-time">{{ box.status==='active'?'•':'' }}</span>
       </button>
       <div v-if="!mailboxes.length&&!loading" class="empty-side">还没有临时邮箱</div>
@@ -63,9 +69,11 @@ onMounted(async()=>{const result=new URLSearchParams(location.search).get('gmail
         <section v-for="account in accounts" :key="account.id" class="connect-card"><div class="connect-mark">G</div><div class="connect-copy"><strong>{{ account.emailAddress }}</strong><span>Gmail · {{ account.authStatus==='connected'?'已授权只读访问':account.authStatus }}</span></div><span class="source-tag">{{ account.syncStatus==='idle'?'等待同步':'同步 '+account.syncStatus }}</span><button class="secondary" :disabled="busy||account.authStatus!=='connected'" @click="syncGmail(account)">立即同步</button></section>
         <section class="page-heading"><div><p class="eyebrow">MAIL WORKSPACE</p><h1>收件箱</h1><p>管理临时地址，集中查看收到的邮件。</p></div><button class="primary" :disabled="busy" @click="createMailbox"><span>＋</span> 创建临时邮箱</button></section>
         <template v-if="selectedMailbox"><section v-for="box in mailboxes.filter(b=>b.id===selectedMailbox)" :key="box.id" class="mailbox-card"><div class="box-icon">✉</div><div class="box-main"><span class="box-caption">当前临时邮箱</span><div class="box-address">{{ box.address }} <button class="copy-btn" @click="copyAddress(box.address)">复制</button></div><span class="box-expiry" :class="box.status">{{ expiry(box.expiresAt) }}</span></div><div class="box-actions"><button class="secondary" :disabled="busy||box.status!=='active'" @click="renewMailbox(box)">延长 60 分钟</button><button class="danger-quiet" :disabled="busy" @click="deleteMailbox(box)">删除</button></div></section></template>
-        <section class="inbox-card"><div class="list-heading"><div><h2>邮件</h2><span>{{ visibleEmails.length }} 封</span></div><button class="text-action" @click="selectedMailbox=''">{{ selectedMailbox?'查看全部':'' }}</button></div>
-          <div v-if="loading" class="empty-state">正在读取邮件…</div><div v-else-if="!visibleEmails.length" class="empty-state"><div class="empty-icon">✉</div><strong>还没有邮件</strong><span>创建临时邮箱并将地址提供给发件人。</span></div>
+        <section class="inbox-card"><div class="list-heading"><div><h2>邮件</h2><span>{{ visibleEmails.length }} 封</span></div><button class="text-action" @click="selectedMailbox='';reload()">{{ selectedMailbox?'查看全部':'' }}</button></div>
+          <div class="inbox-filters"><label class="search-box"><span>⌕</span><input v-model="search" type="search" maxlength="120" placeholder="搜索主题或发件人" aria-label="搜索主题或发件人" @input="searchChanged"></label><select v-model="sourceFilter" aria-label="按来源筛选" @change="filtersChanged"><option value="all">所有来源</option><option value="temporary">临时邮箱</option><option value="gmail">Gmail</option></select><select v-model="unreadFilter" aria-label="按已读状态筛选" @change="filtersChanged"><option value="all">全部邮件</option><option value="true">未读</option><option value="false">已读</option></select></div>
+          <div v-if="loading" class="empty-state">正在读取邮件…</div><div v-else-if="!visibleEmails.length" class="empty-state"><div class="empty-icon">✉</div><strong>{{ search||sourceFilter!=='all'||unreadFilter!=='all'?'没有符合条件的邮件':'还没有邮件' }}</strong><span>{{ search||sourceFilter!=='all'||unreadFilter!=='all'?'试试调整搜索词或筛选条件。':'创建临时邮箱并将地址提供给发件人。' }}</span></div>
           <button v-for="item in visibleEmails" :key="item.id" class="email-row" :class="{unread:!item.localIsRead}" @click="openEmail(item)"><span class="unread-dot"></span><div class="email-content"><div class="email-meta"><strong>{{ item.fromAddress||'未知发件人' }}</strong><time>{{ date(item.receivedAt) }}</time></div><div class="email-subject">{{ item.subject||'（无主题）' }}</div><div class="email-snippet">{{ item.snippet }}</div></div><span class="row-arrow">›</span></button>
+          <div v-if="nextCursor" class="load-more"><button class="secondary" :disabled="loadingMore" @click="loadMore">{{ loadingMore?'正在加载…':'加载更多' }}</button></div>
         </section>
         <footer>邮件内容仅保存在你的 Cloudflare 账户中 <span>·</span> 临时邮箱到期后立即停止访问</footer>
       </template>

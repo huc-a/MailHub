@@ -76,7 +76,10 @@
         "required": [
           "id",
           "source",
+          "mailboxId",
+          "fromAddress",
           "subject",
+          "snippet",
           "receivedAt",
           "localIsRead"
         ],
@@ -92,24 +95,29 @@
               "outlook"
             ]
           },
+          "mailboxId": {
+            "type": "string",
+            "nullable": true
+          },
+          "fromAddress": {
+            "type": "string"
+          },
           "subject": {
             "type": "string"
           },
-          "from": {
+          "snippet": {
             "type": "string"
           },
           "receivedAt": {
-            "type": "string",
-            "format": "date-time"
+            "type": "integer",
+            "description": "Unix epoch milliseconds"
           },
           "localIsRead": {
-            "type": "boolean"
-          },
-          "hasAttachments": {
-            "type": "boolean"
-          },
-          "hasVerificationCandidate": {
-            "type": "boolean"
+            "type": "integer",
+            "enum": [
+              0,
+              1
+            ]
           }
         }
       },
@@ -348,12 +356,11 @@
                 "schema": {
                   "type": "object",
                   "required": [
-                    "items",
-                    "nextCursor",
-                    "serverTime"
+                    "emails",
+                    "nextCursor"
                   ],
                   "properties": {
-                    "items": {
+                    "emails": {
                       "type": "array",
                       "items": {
                         "$ref": "#/components/schemas/EmailSummary"
@@ -362,10 +369,6 @@
                     "nextCursor": {
                       "type": "string",
                       "nullable": true
-                    },
-                    "serverTime": {
-                      "type": "string",
-                      "format": "date-time"
                     }
                   }
                 }
@@ -390,12 +393,10 @@
             "schema": {
               "type": "string",
               "enum": [
-                "all",
                 "temporary",
                 "gmail",
                 "outlook"
-              ],
-              "default": "all"
+              ]
             }
           },
           {
@@ -421,15 +422,7 @@
             "in": "query",
             "schema": {
               "type": "string",
-              "maxLength": 256
-            }
-          },
-          {
-            "name": "accountId",
-            "in": "query",
-            "schema": {
-              "type": "string",
-              "maxLength": 256
+              "format": "uuid"
             }
           },
           {
@@ -437,7 +430,7 @@
             "in": "query",
             "schema": {
               "type": "string",
-              "maxLength": 256
+              "maxLength": 120
             }
           },
           {

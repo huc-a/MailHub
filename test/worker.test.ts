@@ -51,7 +51,40 @@ describe('Worker API foundation', () => {
     expect(queries.some(sql => sql.includes('from_address AS fromAddress'))).toBe(true);
     expect(await response.json()).toMatchObject({ emails: [{ id: 'mail-1' }] });
   });
-  it('uses a valid quoted sender alias when loading an email detail', async () => {
+  it('applies mailbox, source, unread and metadata search filters with bound values', async () => {
+    let emailQuery = '', emailValues: unknown[] = [];
+    const db = { prepare: (sql: string) => ({ bind: (...values: unknown[]) => {
+      if (sql.includes('FROM emails WHERE')) { emailQuery = sql; emailValues = values; }
+      return { first: async () => ({ id: 'owner-1' }), all: async () => ({ results: [] }), run: async () => ({ meta: { changes: 0 } }) };
+    } }), batch: async () => [] };
+    const response = await worker.fetch(new Request('https://mailhub.test/api/v1/emails?limit=40&mailboxId=11111111-1111-4111-8111-111111111111&source=temporary&unread=true&q=Reset%20Code', { headers: { 'X-MailHub-Local-Subject': 'owner' } }), env({ APP_ENV: 'local', ALLOW_LOCAL_AUTH: 'true', DB: db as unknown as Env['DB'] }));
+    expect(response.status).toBe(200);
+    expect(emailQuery).toContain('mailbox_id=?');
+    expect(emailQuery).toContain('source=?');
+    expect(emailQuery).toContain('local_is_read=?');
+    expect(emailQuery).toContain('instr(lower(subject),lower(?))>0');
+    expect(emailValues).toEqual(['owner-1','11111111-1111-4111-8111-111111111111','temporary',0,'Reset Code','Reset Code',40]);
+  });
+  it('rejects invalid email filters before querying the email list', async () => {
+    let listQueried = false;
+    const db = { prepare: (sql: string) => ({ bind: () => ({ first: async () => ({ id: 'owner-1' }), all: async () => { if (sql.includes('FROM emails WHERE')) listQueried = true; return { results: [] }; }, run: async () => ({ meta: { changes: 0 } }) }) }), batch: async () => [] };
+    const response = await worker.fetch(new Request('https://mailhub.test/api/v1/emails?source=unknown', { headers: { 'X-MailHub-Local-Subject': 'owner' } }), env({ APP_ENV: 'local', ALLOW_LOCAL_AUTH: 'true', DB: db as unknown as Env['DB'] }));
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: { code: 'INVALID_SOURCE' } });
+    expect(listQueried).toBe(false);
+  });
+  it('uses the stable cursor tuple together with active filters', async () => {
+    let emailQuery = '', emailValues: unknown[] = [];
+    const db = { prepare: (sql: string) => ({ bind: (...values: unknown[]) => {
+      if (sql.includes('FROM emails WHERE')) { emailQuery = sql; emailValues = values; }
+      return { first: async () => ({ id: 'owner-1' }), all: async () => ({ results: [] }), run: async () => ({ meta: { changes: 0 } }) };
+    } }), batch: async () => [] };
+    const response = await worker.fetch(new Request('https://mailhub.test/api/v1/emails?limit=15&q=hello&cursor=1700000000000.11111111-1111-4111-8111-111111111111', { headers: { 'X-MailHub-Local-Subject': 'owner' } }), env({ APP_ENV: 'local', ALLOW_LOCAL_AUTH: 'true', DB: db as unknown as Env['DB'] }));
+    expect(response.status).toBe(200);
+    expect(emailQuery).toContain('(received_at_ms,id)<(?,?)');
+    expect(emailValues).toEqual(['owner-1','hello','hello',1700000000000,'11111111-1111-4111-8111-111111111111',15]);
+  });
+  it('uses a non-reserved sender alias when loading an email detail', async () => {
     const queries: string[] = [];
     const db = {
       prepare: (sql: string) => {

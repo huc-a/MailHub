@@ -8,8 +8,16 @@
   },
   "browser_e2e": "not executed",
   "real_cloudflare_d1": "not executed",
-  "real_mail_delivery": "not executed",
+  "real_mail_delivery": "PASS: user confirmed production receipt through ear1.de5.net on 2026-10-28",
   "gmail_oauth": "not executed",
+  "latest_module_verification": {
+    "inbox_search_filters_pagination": {
+      "unit_tests": "PASS: 27 tests across 5 files",
+      "production_build": "PASS",
+      "remote_d1_filtered_cursor_query": "PASS",
+      "worker_version": "c2b6a051-c88e-47c3-a196-6549b6d87940"
+    }
+  },
   "document_characters": 22033,
   "html_characters": 39272
 }

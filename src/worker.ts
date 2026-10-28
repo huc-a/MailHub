@@ -340,13 +340,24 @@ const worker = {
     if (url.pathname === '/api/v1/emails' && request.method === 'GET') {
       const limit = Math.min(100,Math.max(1,Number(url.searchParams.get('limit') ?? 30) || 30));
       const cursor = url.searchParams.get('cursor');
+      const mailboxId = url.searchParams.get('mailboxId');
+      const source = url.searchParams.get('source');
+      const unread = url.searchParams.get('unread');
+      const search = (url.searchParams.get('q') ?? '').trim();
       if (cursor && (!/^\d+\.[0-9a-f-]{36}$/i.test(cursor) || !Number.isSafeInteger(Number(cursor.split('.')[0])))) return error('INVALID_CURSOR', 'Invalid email cursor', 400);
-      const query = cursor
-        ? 'SELECT id,source,mailbox_id AS mailboxId,from_address AS fromAddress,subject,snippet,received_at_ms AS receivedAt,local_is_read AS localIsRead FROM emails WHERE user_id=? AND ingest_status=\'ready\' AND (received_at_ms,id)<(?,?) ORDER BY received_at_ms DESC,id DESC LIMIT ?'
-        : 'SELECT id,source,mailbox_id AS mailboxId,from_address AS fromAddress,subject,snippet,received_at_ms AS receivedAt,local_is_read AS localIsRead FROM emails WHERE user_id=? AND ingest_status=\'ready\' ORDER BY received_at_ms DESC,id DESC LIMIT ?';
-      const statement = cursor
-        ? env.DB.prepare(query).bind(owner,Number(cursor.split('.')[0]),cursor.split('.')[1],limit)
-        : env.DB.prepare(query).bind(owner,limit);
+      if (mailboxId && !/^[0-9a-f-]{36}$/i.test(mailboxId)) return error('INVALID_MAILBOX_ID', 'Invalid mailbox filter', 400);
+      if (source && !['temporary','gmail','outlook'].includes(source)) return error('INVALID_SOURCE', 'Unsupported email source', 400);
+      if (unread !== null && unread !== 'true' && unread !== 'false') return error('INVALID_UNREAD_FILTER', 'unread must be true or false', 400);
+      if (search.length > 120) return error('INVALID_QUERY', 'Search text must be 120 characters or fewer', 400);
+      const clauses = ["user_id=?", "ingest_status='ready'"], values: unknown[] = [owner];
+      if (mailboxId) { clauses.push('mailbox_id=?'); values.push(mailboxId); }
+      if (source) { clauses.push('source=?'); values.push(source); }
+      if (unread !== null) { clauses.push('local_is_read=?'); values.push(unread === 'true' ? 0 : 1); }
+      if (search) { clauses.push('(instr(lower(subject),lower(?))>0 OR instr(lower(from_address),lower(?))>0)'); values.push(search,search); }
+      if (cursor) { clauses.push('(received_at_ms,id)<(?,?)'); values.push(Number(cursor.split('.')[0]),cursor.split('.')[1]); }
+      const query = `SELECT id,source,mailbox_id AS mailboxId,from_address AS fromAddress,subject,snippet,received_at_ms AS receivedAt,local_is_read AS localIsRead FROM emails WHERE ${clauses.join(' AND ')} ORDER BY received_at_ms DESC,id DESC LIMIT ?`;
+      values.push(limit);
+      const statement = env.DB.prepare(query).bind(...values);
       const result = await statement.all<Record<string, unknown>>();
       const emails = result.results ?? [];
       const last = emails.at(-1);
