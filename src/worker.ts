@@ -302,6 +302,17 @@ const worker = {
       const result=await env.DB.prepare("SELECT id,provider,email_address AS emailAddress,auth_status AS authStatus,sync_status AS syncStatus,last_synced_at_ms AS lastSyncedAt,COALESCE(json_extract(sync_scope_json,'$.connectionType'),'gmail_oauth') AS connectionType,json_extract(sync_scope_json,'$.imapProvider') AS imapProvider,json_extract(sync_scope_json,'$.folders') AS folders FROM provider_accounts WHERE user_id=? ORDER BY created_at_ms DESC").bind(owner).all<Record<string,unknown>>();
       return json({accounts:result.results??[]});
     }
+    if(url.pathname==='/api/v1/accounts/forwarded-imap/folders'&&request.method==='POST'){
+      if(!sameOrigin(request))return error('CSRF_REJECTED','Same-origin request required',403);
+      if(!validJson(request))return error('UNSUPPORTED_MEDIA_TYPE','Content-Type must be application/json',415);
+      let body:{provider?:unknown;emailAddress?:unknown;appPassword?:unknown};try{body=await request.json() as typeof body;}catch{return error('INVALID_JSON','Request body must be JSON',400);}
+      const hosts:Record<string,string>={qq:'imap.qq.com',gmail:'imap.gmail.com'},provider=typeof body.provider==='string'?body.provider:'',host=hosts[provider];
+      const emailAddress=typeof body.emailAddress==='string'?body.emailAddress.trim().toLowerCase():'',appPassword=typeof body.appPassword==='string'?body.appPassword.replace(/\s/g,''):'';
+      if(!host)return error('INVALID_IMAP_PROVIDER','Choose QQ Mail or Gmail',400);
+      if(emailAddress.length>254||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailAddress))return error('INVALID_EMAIL','Enter a valid mailbox address',400);
+      if(appPassword.length<8||appPassword.length>512)return error('INVALID_IMAP_PASSWORD','Enter a valid IMAP app password',400);
+      try{return json({folders:await testImapConnection(host,993,emailAddress,appPassword)});}catch(failure){return error('IMAP_CONNECTION_FAILED',failure instanceof Error?failure.message.slice(0,160):'Could not authenticate to the IMAP server',502);}
+    }
     if(url.pathname==='/api/v1/accounts/forwarded-imap'&&request.method==='POST'){
       if(!sameOrigin(request))return error('CSRF_REJECTED','Same-origin request required',403);
       if(!validJson(request))return error('UNSUPPORTED_MEDIA_TYPE','Content-Type must be application/json',415);
@@ -312,7 +323,7 @@ const worker = {
       if(!host)return error('INVALID_IMAP_PROVIDER','Choose QQ Mail or Gmail',400);
       if(emailAddress.length>254||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailAddress))return error('INVALID_EMAIL','Enter a valid mailbox address',400);
       if(appPassword.length<8||appPassword.length>512)return error('INVALID_IMAP_PASSWORD','Enter a valid IMAP app password',400);
-      if(!folders.length||folders.length>10||folders.some(folder=>folder.length>200||/[\u0000-\u001f\u007f]/.test(folder)))return error('INVALID_IMAP_FOLDERS','Choose between 1 and 10 valid folders',400);
+      if(!folders.length||folders.length>50||folders.some(folder=>folder.length>200||/[\u0000-\u001f\u007f]/.test(folder)))return error('INVALID_IMAP_FOLDERS','Choose between 1 and 50 valid folders',400);
       let available:Awaited<ReturnType<typeof testImapConnection>>;try{available=await testImapConnection(host,993,emailAddress,appPassword);}catch(failure){return error('IMAP_CONNECTION_FAILED',failure instanceof Error?failure.message.slice(0,160):'Could not authenticate to the IMAP server',502);}
       const folderNames=new Set(available.map(folder=>folder.name.toLowerCase()));if(folders.some(folder=>!folderNames.has(folder.toLowerCase())))return error('IMAP_FOLDER_NOT_FOUND',`Folder not found: ${folders.find(folder=>!folderNames.has(folder.toLowerCase()))}`,400);
       const subject=`forwarded-imap:${emailAddress}`,existing=await env.DB.prepare("SELECT id FROM provider_accounts WHERE user_id=? AND provider='gmail' AND provider_subject=?").bind(owner,subject).first<{id:string}>(),id=existing?.id??crypto.randomUUID(),now=Date.now(),encrypted=await encryptSecret(appPassword,env.TOKEN_ENCRYPTION_KEY,`provider-account:${owner}:${id}:imap`),scope=JSON.stringify({connectionType:'forwarded_imap',imapProvider:provider,host,port:993,folders});
