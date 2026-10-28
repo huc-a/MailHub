@@ -429,24 +429,39 @@ const worker = {
       const cursor = url.searchParams.get('cursor');
       const mailboxId = url.searchParams.get('mailboxId');
       const source = url.searchParams.get('source');
+      const folder = url.searchParams.get('folder');
       const unread = url.searchParams.get('unread');
       const search = (url.searchParams.get('q') ?? '').trim();
       if (cursor && (!/^\d+\.[0-9a-f-]{36}$/i.test(cursor) || !Number.isSafeInteger(Number(cursor.split('.')[0])))) return error('INVALID_CURSOR', 'Invalid email cursor', 400);
       if (mailboxId && !/^[0-9a-f-]{36}$/i.test(mailboxId)) return error('INVALID_MAILBOX_ID', 'Invalid mailbox filter', 400);
-      if (source && !['temporary','gmail','outlook'].includes(source)) return error('INVALID_SOURCE', 'Unsupported email source', 400);
+      if (source && !['temporary','gmail','outlook','forwarded'].includes(source)) return error('INVALID_SOURCE', 'Unsupported email source', 400);
+      if (folder !== null && (folder.length > 200 || !folder || /[\u0000-\u001f\u007f]/.test(folder))) return error('INVALID_FOLDER', 'Invalid forwarding folder filter', 400);
       if (unread !== null && unread !== 'true' && unread !== 'false') return error('INVALID_UNREAD_FILTER', 'unread must be true or false', 400);
       if (search.length > 120) return error('INVALID_QUERY', 'Search text must be 120 characters or fewer', 400);
       const clauses = ["user_id=?", "ingest_status='ready'"], values: unknown[] = [owner];
+      if (folder) {
+        const linked = await env.DB.prepare("SELECT id,sync_scope_json AS syncScope FROM provider_accounts WHERE user_id=? AND provider='gmail' AND json_extract(sync_scope_json,'$.connectionType')='forwarded_imap'").bind(owner).all<{id:string;syncScope:string}>();
+        const matched = (linked.results ?? []).find(account => { try { const folders=(JSON.parse(account.syncScope) as {folders?:unknown}).folders;return Array.isArray(folders)&&folders.includes(folder); } catch { return false; } });
+        if (!matched) return error('NOT_FOUND','Forwarding folder not found',404);
+        const prefix=`imap:${folder}:`;
+        clauses.push('provider_account_id=?');values.push(matched.id);
+        clauses.push('substr(provider_message_id,1,?)=?');values.push(prefix.length,prefix);
+      }
+      if (source === 'forwarded' && !folder) {
+        const linked = await env.DB.prepare("SELECT id FROM provider_accounts WHERE user_id=? AND provider='gmail' AND json_extract(sync_scope_json,'$.connectionType')='forwarded_imap'").bind(owner).all<{id:string}>();
+        const ids=(linked.results??[]).map(account=>account.id);
+        if(ids.length){clauses.push(`provider_account_id IN (${ids.map(()=>'?').join(',')})`);values.push(...ids);clauses.push("substr(provider_message_id,1,5)='imap:'");}else clauses.push('1=0');
+      }
       if (mailboxId) { clauses.push('mailbox_id=?'); values.push(mailboxId); }
-      if (source) { clauses.push('source=?'); values.push(source); }
+      if (source && source!=='forwarded') { clauses.push('source=?'); values.push(source); }
       if (unread !== null) { clauses.push('local_is_read=?'); values.push(unread === 'true' ? 0 : 1); }
       if (search) { clauses.push('(instr(lower(subject),lower(?))>0 OR instr(lower(from_address),lower(?))>0)'); values.push(search,search); }
       if (cursor) { clauses.push('(received_at_ms,id)<(?,?)'); values.push(Number(cursor.split('.')[0]),cursor.split('.')[1]); }
-      const query = `SELECT id,source,mailbox_id AS mailboxId,from_address AS fromAddress,subject,snippet,received_at_ms AS receivedAt,local_is_read AS localIsRead FROM emails WHERE ${clauses.join(' AND ')} ORDER BY received_at_ms DESC,id DESC LIMIT ?`;
+      const query = `SELECT id,source,mailbox_id AS mailboxId,provider_message_id AS providerMessageId,from_address AS fromAddress,subject,snippet,received_at_ms AS receivedAt,local_is_read AS localIsRead FROM emails WHERE ${clauses.join(' AND ')} ORDER BY received_at_ms DESC,id DESC LIMIT ?`;
       values.push(limit);
       const statement = env.DB.prepare(query).bind(...values);
       const result = await statement.all<Record<string, unknown>>();
-      const emails = result.results ?? [];
+      const emails:Array<Record<string,unknown>&{id:string;receivedAt:number;sourceFolder:string|null}> = (result.results ?? []).map(row => { const match=String(row.providerMessageId??'').match(/^imap:(.*):(?:unknown|\d+):\d+$/);const {providerMessageId:_providerMessageId,...safe}=row;return {...safe,sourceFolder:match?.[1]??null} as Record<string,unknown>&{id:string;receivedAt:number;sourceFolder:string|null}; });
       const last = emails.at(-1);
       return json({ emails, nextCursor: emails.length === limit && last ? `${last.receivedAt}.${last.id}` : null });
     }
@@ -470,11 +485,12 @@ const worker = {
         const filename = item.filename.replace(/[\r\n"\\]/g,'_').slice(0,180) || 'attachment';
         return new Response(await stored.arrayBuffer(), { headers: { 'Content-Type':'application/octet-stream','Content-Disposition':`attachment; filename="${filename.replace(/[^\x20-\x7e]/g,'_')}"; filename*=UTF-8''${encodeURIComponent(filename)}`,'Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff' } });
       }
-      const email = await env.DB.prepare(`SELECT e.id,e.source,e.mailbox_id AS mailboxId,e.from_address AS fromAddress,e.to_addresses_json AS toAddresses,e.subject,e.snippet,e.received_at_ms AS receivedAt,e.local_is_read AS localIsRead,e.otp_candidates_json AS otpCandidates,e.body_truncated AS bodyTruncated,mo.object_key AS textKey,EXISTS(SELECT 1 FROM mail_objects h WHERE h.email_id=e.id AND h.kind='html' AND h.status='uploaded') AS hasHtml FROM emails e LEFT JOIN mail_objects mo ON mo.email_id=e.id AND mo.kind='text' AND mo.status='uploaded' WHERE ${scope}`).bind(emailId,owner,Date.now()).first<Record<string,unknown> & {textKey?:string}>();
+      const email = await env.DB.prepare(`SELECT e.id,e.source,e.mailbox_id AS mailboxId,e.provider_message_id AS providerMessageId,e.from_address AS fromAddress,e.to_addresses_json AS toAddresses,e.subject,e.snippet,e.received_at_ms AS receivedAt,e.local_is_read AS localIsRead,e.otp_candidates_json AS otpCandidates,e.body_truncated AS bodyTruncated,mo.object_key AS textKey,EXISTS(SELECT 1 FROM mail_objects h WHERE h.email_id=e.id AND h.kind='html' AND h.status='uploaded') AS hasHtml FROM emails e LEFT JOIN mail_objects mo ON mo.email_id=e.id AND mo.kind='text' AND mo.status='uploaded' WHERE ${scope}`).bind(emailId,owner,Date.now()).first<Record<string,unknown> & {textKey?:string}>();
       if (!email) return error('NOT_FOUND','Email not found',404);
       const stored = email.textKey ? await env.MAIL_OBJECTS.get(email.textKey) : null;
       const attachments = await env.DB.prepare('SELECT id,filename,content_type AS contentType,size_bytes AS size,skipped_reason AS skippedReason FROM email_attachments WHERE email_id=? ORDER BY id').bind(emailId).all<Record<string,unknown>>();
-      return json({ email: { ...email, text: stored ? await stored.text() : '', toAddresses: JSON.parse(String(email.toAddresses)), otpCandidates: JSON.parse(String(email.otpCandidates)), attachments: attachments.results ?? [] } });
+      const match=String(email.providerMessageId??'').match(/^imap:(.*):(?:unknown|\d+):\d+$/),{providerMessageId:_providerMessageId,...safeEmail}=email;
+      return json({ email: { ...safeEmail,sourceFolder:match?.[1]??null,text: stored ? await stored.text() : '', toAddresses: JSON.parse(String(email.toAddresses)), otpCandidates: JSON.parse(String(email.otpCandidates)), attachments: attachments.results ?? [] } });
     }
     if (readPath && request.method === 'PATCH' && !readPath[2]) {
       if (!sameOrigin(request)) return error('CSRF_REJECTED','Same-origin request required',403);

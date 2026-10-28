@@ -65,6 +65,18 @@ describe('Worker API foundation', () => {
     expect(emailQuery).toContain('instr(lower(subject),lower(?))>0');
     expect(emailValues).toEqual(['owner-1','11111111-1111-4111-8111-111111111111','temporary',0,'Reset Code','Reset Code',40]);
   });
+  it('scopes a fixed forwarding folder to its configured IMAP account and folder prefix', async () => {
+    let emailQuery='',emailValues:unknown[]=[];
+    const db={prepare:(sql:string)=>({bind:(...values:unknown[])=>({first:async()=>({id:'owner-1'}),all:async()=>{if(sql.includes('FROM provider_accounts'))return{results:[{id:'hub-1',syncScope:JSON.stringify({connectionType:'forwarded_imap',folders:['My Folders/person@example.net']})}]};if(sql.includes('FROM emails WHERE')){emailQuery=sql;emailValues=values;return{results:[{id:'mail-1',providerMessageId:'imap:My Folders/person@example.net:33:10',receivedAt:1}]};}return{results:[]};},run:async()=>({meta:{changes:0}})})}),batch:async()=>[]};
+    const response=await worker.fetch(new Request('https://mailhub.test/api/v1/emails?folder='+encodeURIComponent('My Folders/person@example.net'),{headers:{'X-MailHub-Local-Subject':'owner'}}),env({APP_ENV:'local',ALLOW_LOCAL_AUTH:'true',DB:db as unknown as Env['DB']}));
+    expect(response.status).toBe(200);expect(emailQuery).toContain('provider_account_id=?');expect(emailQuery).toContain('substr(provider_message_id,1,?)=?');expect(emailValues).toContain('hub-1');expect(emailValues).toContain('imap:My Folders/person@example.net:');expect(await response.json()).toMatchObject({emails:[{id:'mail-1',sourceFolder:'My Folders/person@example.net'}]});
+  });
+  it('limits all-forwarded view to configured hub accounts rather than OAuth Gmail', async () => {
+    let emailQuery='',emailValues:unknown[]=[];
+    const db={prepare:(sql:string)=>({bind:(...values:unknown[])=>({first:async()=>({id:'owner-1'}),all:async()=>{if(sql.includes('FROM provider_accounts'))return{results:[{id:'hub-1'},{id:'hub-2'}]};if(sql.includes('FROM emails WHERE')){emailQuery=sql;emailValues=values;}return{results:[]};},run:async()=>({meta:{changes:0}})})}),batch:async()=>[]};
+    const response=await worker.fetch(new Request('https://mailhub.test/api/v1/emails?source=forwarded',{headers:{'X-MailHub-Local-Subject':'owner'}}),env({APP_ENV:'local',ALLOW_LOCAL_AUTH:'true',DB:db as unknown as Env['DB']}));
+    expect(response.status).toBe(200);expect(emailQuery).toContain('provider_account_id IN (?,?)');expect(emailQuery).toContain("substr(provider_message_id,1,5)='imap:'");expect(emailQuery).not.toContain('source=?');expect(emailValues).toEqual(['owner-1','hub-1','hub-2',30]);
+  });
   it('rejects invalid email filters before querying the email list', async () => {
     let listQueried = false;
     const db = { prepare: (sql: string) => ({ bind: () => ({ first: async () => ({ id: 'owner-1' }), all: async () => { if (sql.includes('FROM emails WHERE')) listQueried = true; return { results: [] }; }, run: async () => ({ meta: { changes: 0 } }) }) }), batch: async () => [] };
