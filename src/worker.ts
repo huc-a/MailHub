@@ -252,7 +252,7 @@ async function ownerId(request: Request, env: Env): Promise<string | null> {
 }
 
 const worker = {
-  async fetch(request: Request, env: Env) {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext) {
     const url = new URL(request.url);
     if(url.pathname==='/oauth/gmail/callback'&&request.method==='GET'){
       const owner=await ownerId(request,env);
@@ -329,6 +329,7 @@ const worker = {
       const subject=`forwarded-imap:${emailAddress}`,existing=await env.DB.prepare("SELECT id FROM provider_accounts WHERE user_id=? AND provider='gmail' AND provider_subject=?").bind(owner,subject).first<{id:string}>(),id=existing?.id??crypto.randomUUID(),now=Date.now(),encrypted=await encryptSecret(appPassword,env.TOKEN_ENCRYPTION_KEY,`provider-account:${owner}:${id}:imap`),scope=JSON.stringify({connectionType:'forwarded_imap',imapProvider:provider,host,port:993,folders});
       await env.DB.prepare("INSERT INTO provider_accounts(id,user_id,provider,provider_subject,email_address,auth_status,encrypted_refresh_token,key_version,granted_scopes_json,sync_scope_json,next_sync_at_ms,created_at_ms) VALUES(?,?,'gmail',?,?,'connected',?,?,'[]',?,NULL,?) ON CONFLICT(user_id,provider,provider_subject) DO UPDATE SET email_address=excluded.email_address,auth_status='connected',encrypted_refresh_token=excluded.encrypted_refresh_token,key_version=excluded.key_version,sync_scope_json=excluded.sync_scope_json,committed_cursor=NULL,sync_status='queued',next_sync_at_ms=NULL,lease_token=NULL,lease_expires_at_ms=NULL").bind(id,owner,subject,emailAddress,encrypted,env.TOKEN_KEY_VERSION??'v1',scope,now).run();
       const jobId=crypto.randomUUID();await env.DB.prepare("INSERT OR IGNORE INTO jobs(id,user_id,kind,target_id,dedup_key,status,available_at_ms,created_at_ms,updated_at_ms) VALUES(?,?,'sync',?,'sync:'||?,'pending',?,?,?)").bind(jobId,owner,id,id,now,now,now).run();
+      if(ctx)ctx.waitUntil(runScheduled(env));
       return json({account:{id,provider:'gmail',connectionType:'forwarded_imap',emailAddress,authStatus:'connected',syncStatus:'queued'},folders:available.map(folder=>folder.name)},202);
     }
     const syncPath=url.pathname.match(/^\/api\/v1\/accounts\/([0-9a-f-]{36})\/sync$/i);
@@ -341,6 +342,7 @@ const worker = {
       await env.DB.prepare("INSERT OR IGNORE INTO jobs(id,user_id,kind,target_id,dedup_key,status,available_at_ms,created_at_ms,updated_at_ms) VALUES(?,?,'sync',?,'sync:'||?,'pending',?,?,?)").bind(jobId,owner,account.id,account.id,now,now,now).run();
       const job=await env.DB.prepare("SELECT id,status FROM jobs WHERE dedup_key=? AND status IN ('pending','running','retry_wait')").bind(`sync:${account.id}`).first<{id:string;status:string}>();
       await env.DB.prepare("UPDATE provider_accounts SET sync_status='queued' WHERE id=? AND user_id=? AND auth_status='connected'").bind(account.id,owner).run();
+      if(ctx)ctx.waitUntil(runScheduled(env));
       return json({jobId:job?.id??jobId,status:job?.status??'pending'},202);
     }
     if(url.pathname==='/api/v1/accounts/gmail/connect'&&request.method==='POST'){
@@ -428,14 +430,17 @@ const worker = {
       const limit = Math.min(100,Math.max(1,Number(url.searchParams.get('limit') ?? 30) || 30));
       const cursor = url.searchParams.get('cursor');
       const mailboxId = url.searchParams.get('mailboxId');
+      const accountId = url.searchParams.get('accountId');
       const source = url.searchParams.get('source');
       const folder = url.searchParams.get('folder');
       const unread = url.searchParams.get('unread');
       const search = (url.searchParams.get('q') ?? '').trim();
       if (cursor && (!/^\d+\.[0-9a-f-]{36}$/i.test(cursor) || !Number.isSafeInteger(Number(cursor.split('.')[0])))) return error('INVALID_CURSOR', 'Invalid email cursor', 400);
       if (mailboxId && !/^[0-9a-f-]{36}$/i.test(mailboxId)) return error('INVALID_MAILBOX_ID', 'Invalid mailbox filter', 400);
+      if (accountId && !/^[0-9a-f-]{36}$/i.test(accountId)) return error('INVALID_ACCOUNT_ID', 'Invalid account filter', 400);
       if (source && !['temporary','gmail','outlook','forwarded'].includes(source)) return error('INVALID_SOURCE', 'Unsupported email source', 400);
       if (folder !== null && (folder.length > 200 || !folder || /[\u0000-\u001f\u007f]/.test(folder))) return error('INVALID_FOLDER', 'Invalid forwarding folder filter', 400);
+      if (folder && accountId) return error('INVALID_SOURCE_FILTER','Choose either a provider account or a forwarding folder',400);
       if (unread !== null && unread !== 'true' && unread !== 'false') return error('INVALID_UNREAD_FILTER', 'unread must be true or false', 400);
       if (search.length > 120) return error('INVALID_QUERY', 'Search text must be 120 characters or fewer', 400);
       const clauses = ["user_id=?", "ingest_status='ready'"], values: unknown[] = [owner];
@@ -446,6 +451,11 @@ const worker = {
         const prefix=`imap:${folder}:`;
         clauses.push('provider_account_id=?');values.push(matched.id);
         clauses.push('substr(provider_message_id,1,?)=?');values.push(prefix.length,prefix);
+      }
+      if (accountId) {
+        const account=await env.DB.prepare("SELECT id FROM provider_accounts WHERE id=? AND user_id=? AND auth_status='connected'").bind(accountId,owner).first<{id:string}>();
+        if(!account)return error('NOT_FOUND','Connected mail account not found',404);
+        clauses.push('provider_account_id=?');values.push(account.id);
       }
       if (source === 'forwarded' && !folder) {
         const linked = await env.DB.prepare("SELECT id FROM provider_accounts WHERE user_id=? AND provider='gmail' AND json_extract(sync_scope_json,'$.connectionType')='forwarded_imap'").bind(owner).all<{id:string}>();

@@ -77,6 +77,12 @@ describe('Worker API foundation', () => {
     const response=await worker.fetch(new Request('https://mailhub.test/api/v1/emails?source=forwarded',{headers:{'X-MailHub-Local-Subject':'owner'}}),env({APP_ENV:'local',ALLOW_LOCAL_AUTH:'true',DB:db as unknown as Env['DB']}));
     expect(response.status).toBe(200);expect(emailQuery).toContain('provider_account_id IN (?,?)');expect(emailQuery).toContain("substr(provider_message_id,1,5)='imap:'");expect(emailQuery).not.toContain('source=?');expect(emailValues).toEqual(['owner-1','hub-1','hub-2',30]);
   });
+  it('scopes a selected provider mailbox to a connected account owned by the caller', async () => {
+    let emailQuery='',emailValues:unknown[]=[];
+    const db={prepare:(sql:string)=>({bind:(...values:unknown[])=>({first:async()=>sql.includes('FROM provider_accounts')?{id:'account-1'}:{id:'owner-1'},all:async()=>{if(sql.includes('FROM emails WHERE')){emailQuery=sql;emailValues=values;}return{results:[]};},run:async()=>({meta:{changes:0}})})}),batch:async()=>[]};
+    const response=await worker.fetch(new Request('https://mailhub.test/api/v1/emails?accountId=11111111-1111-4111-8111-111111111111',{headers:{'X-MailHub-Local-Subject':'owner'}}),env({APP_ENV:'local',ALLOW_LOCAL_AUTH:'true',DB:db as unknown as Env['DB']}));
+    expect(response.status).toBe(200);expect(emailQuery).toContain('provider_account_id=?');expect(emailValues).toEqual(['owner-1','account-1',30]);
+  });
   it('rejects invalid email filters before querying the email list', async () => {
     let listQueried = false;
     const db = { prepare: (sql: string) => ({ bind: () => ({ first: async () => ({ id: 'owner-1' }), all: async () => { if (sql.includes('FROM emails WHERE')) listQueried = true; return { results: [] }; }, run: async () => ({ meta: { changes: 0 } }) }) }), batch: async () => [] };
