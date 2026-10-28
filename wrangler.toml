@@ -11,7 +11,7 @@ run_worker_first = true
 [[d1_databases]]
 binding = "DB"
 database_name = "mailhub-dev"
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "d71b8456-203f-4da0-ad0b-5bab7e7fd915"
 migrations_dir = "migrations"
 
 [[r2_buckets]]
