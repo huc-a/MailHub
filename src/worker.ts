@@ -240,6 +240,11 @@ const worker = {
     const owner = await ownerId(request, env);
     if (!owner) return error('UNAUTHENTICATED', 'Access authentication required', 401);
     if (url.pathname === '/api/v1/me' && request.method === 'GET') return json({ id: owner });
+    if(url.pathname==='/api/v1/accounts/gmail/status'&&request.method==='GET'){
+      const missingSecrets=['GOOGLE_CLIENT_ID','GOOGLE_CLIENT_SECRET','TOKEN_ENCRYPTION_KEY'].filter(name=>!env[name as 'GOOGLE_CLIENT_ID'|'GOOGLE_CLIENT_SECRET'|'TOKEN_ENCRYPTION_KEY']);
+      let redirectUri:string|null=null;try{if(env.APP_BASE_URL){const base=new URL(env.APP_BASE_URL);if(base.protocol==='https:'&&!base.search&&!base.hash)redirectUri=`${base.origin}${base.pathname.replace(/\/$/,'')}/oauth/gmail/callback`;}}catch{/* Invalid base URL is reported as unconfigured below. */}
+      return json({configured:missingSecrets.length===0&&redirectUri!==null,missingSecrets,redirectUri});
+    }
     if (url.pathname === '/api/v1/jobs' && request.method === 'GET') {
       const limit=Math.min(100,Math.max(1,Number(url.searchParams.get('limit')??50)||50));
       const result=await env.DB.prepare("SELECT j.id,j.kind,j.target_id AS targetId,COALESCE(pa.email_address,mb.address,'') AS targetLabel,j.status,j.attempts,j.max_attempts AS maxAttempts,j.available_at_ms AS availableAt,j.error_code AS errorCode,j.created_at_ms AS createdAt,j.updated_at_ms AS updatedAt FROM jobs j LEFT JOIN provider_accounts pa ON j.kind='sync' AND pa.id=j.target_id AND pa.user_id=j.user_id LEFT JOIN mailboxes mb ON j.kind='cleanup_mailbox' AND mb.id=j.target_id AND mb.user_id=j.user_id WHERE j.user_id=? ORDER BY j.created_at_ms DESC,j.id DESC LIMIT ?").bind(owner,limit).all<Record<string,unknown>>();
