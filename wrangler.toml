@@ -1,0 +1,24 @@
+name = "mailhub"
+main = "src/worker.ts"
+compatibility_date = "2026-10-26"
+workers_dev = false
+
+[assets]
+directory = "./dist/client"
+binding = "ASSETS"
+run_worker_first = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "mailhub-dev"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "MAIL_OBJECTS"
+bucket_name = "mailhub-dev"
+
+[vars]
+APP_ENV = "local"
+MAIL_DOMAIN = "inbox.example.invalid"
+
