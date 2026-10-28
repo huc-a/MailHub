@@ -83,6 +83,19 @@ describe('Worker API foundation', () => {
     expect(objects).toHaveLength(1);
     expect(statements.some(sql => sql.includes("SET ingest_status='ready'"))).toBe(true);
   });
+  it('forwards unmatched mail to the existing fallback', async () => {
+    const forwarded: string[] = [];
+    const db = { prepare: () => ({ bind: () => ({ first: async () => null, all: async () => ({ results: [] }), run: async () => ({ meta: { changes: 0 } }) }) }), batch: async () => [] };
+    const response = await worker.email({
+      to: 'legacy@ear1.de5.net',
+      raw: new ReadableStream<Uint8Array>({ start(controller) { controller.close(); } }),
+      rawSize: 0,
+      setReject: reason => { throw new Error(`Unexpected rejection: ${reason}`); },
+      forward: async recipient => { forwarded.push(recipient); },
+    }, env({ FALLBACK_EMAIL: 'verified-destination@example.net', DB: db as unknown as Env['DB'] }));
+    expect(response).toBeUndefined();
+    expect(forwarded).toEqual(['verified-destination@example.net']);
+  });
   it('runs cleanup jobs under a lease and removes R2 objects before metadata', async () => {
     const sqls: string[] = [], deleted: string[] = [];
     const db = {

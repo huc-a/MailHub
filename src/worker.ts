@@ -9,6 +9,7 @@ export interface Env {
   ASSETS: { fetch(request: Request): Promise<Response> };
   APP_ENV: string;
   MAIL_DOMAIN: string;
+  FALLBACK_EMAIL?: string;
   ACCESS_TEAM_DOMAIN?: string;
   ACCESS_AUD?: string;
   ALLOW_LOCAL_AUTH?: string;
@@ -78,9 +79,12 @@ async function completeGoogleOAuth(request: Request, env: Env, owner: string) {
   return oauthRedirect(env,'connected');
 }
 
-async function ingestInbound(message: { to: string; raw: ReadableStream<Uint8Array>; rawSize: number; setReject(reason: string): void }, env: Env) {
+async function ingestInbound(message: { to: string; raw: ReadableStream<Uint8Array>; rawSize: number; setReject(reason: string): void; forward?(recipient: string): Promise<unknown> }, env: Env) {
   const mailbox = await env.DB.prepare("SELECT id,user_id,generation FROM mailboxes WHERE address=? COLLATE NOCASE AND status='active' AND expires_at_ms>? ").bind(message.to.toLowerCase(),Date.now()).first<{id:string;user_id:string;generation:number}>();
-  if (!mailbox) { message.setReject('Unknown or expired mailbox'); return; }
+  if (!mailbox) {
+    if (env.FALLBACK_EMAIL && message.forward) { await message.forward(env.FALLBACK_EMAIL); return; }
+    message.setReject('Unknown or expired mailbox'); return;
+  }
   let raw: Uint8Array;
   try { raw = await readRaw(message.raw,message.rawSize); }
   catch (e) { if (e instanceof Error && e.message === 'RAW_MESSAGE_TOO_LARGE') { message.setReject('Message exceeds the application size limit'); return; } throw e; }
@@ -385,7 +389,7 @@ const worker = {
     }
     return error('NOT_FOUND', 'API route not found', 404);
   },
-  async email(message: { to: string; raw: ReadableStream<Uint8Array>; rawSize: number; setReject(reason: string): void }, env: Env) {
+  async email(message: { to: string; raw: ReadableStream<Uint8Array>; rawSize: number; setReject(reason: string): void; forward?(recipient: string): Promise<unknown> }, env: Env) {
     await ingestInbound(message,env);
   },
   async scheduled(_controller: unknown, env: Env) {
