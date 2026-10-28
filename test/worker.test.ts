@@ -1,5 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import worker, { type Env } from '../src/worker';
+import { encryptSecret } from '../src/security/crypto';
+
+afterEach(()=>vi.unstubAllGlobals());
 
 const env = (overrides: Partial<Env> = {}) => ({
   APP_ENV: 'production', MAIL_DOMAIN: 'mail.test', MAIL_OBJECTS: {},
@@ -86,5 +89,19 @@ describe('Worker API foundation', () => {
     expect(url.searchParams.get('code_challenge')).toHaveLength(43);
     expect(storedSql).toContain('INSERT INTO oauth_states');
   });
+  it('queues an owner-scoped Gmail sync and returns the durable job identity', async () => {
+    const db={prepare:(sql:string)=>({bind:(..._values:unknown[])=>({sql,first:async<T,>()=>(sql.includes('FROM provider_accounts')?{id:'123e4567-e89b-42d3-a456-426614174000',auth_status:'connected',sync_status:'idle'}:sql.includes('FROM jobs')?{id:'job-sync-1',status:'pending'}:{id:'owner-1'}) as T,all:async()=>({results:[]}),run:async()=>({meta:{changes:1}})})}),batch:async()=>[]};
+    const response=await worker.fetch(new Request('http://localhost/api/v1/accounts/123e4567-e89b-42d3-a456-426614174000/sync',{method:'POST',headers:{Origin:'http://localhost','X-MailHub-Local-Subject':'owner'}}),env({APP_ENV:'local',ALLOW_LOCAL_AUTH:'true',DB:db as unknown as Env['DB']}));
+    expect(response.status).toBe(202);expect(await response.json()).toMatchObject({jobId:'job-sync-1',status:'pending'});
+  });
+  it('runs a bounded Gmail bootstrap job through MIME parsing and staged storage', async () => {
+    const key=btoa('k'.repeat(32)),cipher=await encryptSecret('refresh-token',key,'provider-account:owner-1:account-1:gmail'),sqls:string[]=[],objects:string[]=[];
+    const db={prepare:(sql:string)=>({sql,bind:(..._values:unknown[])=>({sql,first:async<T,>()=>(sql.includes('SELECT encrypted_refresh_token')?{encrypted_refresh_token:cipher,key_version:'v1',committed_cursor:null,email_address:'owner@gmail.test'}:sql.includes('SELECT id,ingest_status')?null:null) as T|null,all:async<T,>()=>({results:(sql.includes("FROM jobs WHERE kind='sync'")?[{id:'job-1',user_id:'owner-1',target_id:'account-1',attempts:0,max_attempts:5}]:[]) as T[]}),run:async()=>{sqls.push(sql);return {meta:{changes:1}};}})}),batch:async(statements:{sql:string}[])=>{sqls.push(...statements.map(item=>item.sql));return statements;}};
+    const raw= btoa('From: hello@example.test\r\nTo: owner@gmail.test\r\nSubject: Gmail smoke\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nCode 654321');
+    vi.stubGlobal('fetch',vi.fn(async(input:RequestInfo|URL)=>{const url=String(input);if(url.includes('oauth2.googleapis.com/token'))return Response.json({access_token:'access',expires_in:3600});if(url.endsWith('/profile'))return Response.json({emailAddress:'owner@gmail.test',historyId:'100'});if(url.includes('/messages?'))return Response.json({messages:[{id:'gmail-message-1',threadId:'thread-1'}]});if(url.includes('format=minimal'))return Response.json({id:'gmail-message-1',labelIds:['INBOX']});if(url.includes('format=raw'))return Response.json({id:'gmail-message-1',threadId:'thread-1',raw});throw new Error(`unexpected Gmail request: ${url}`);}));
+    await worker.scheduled({},env({DB:db as unknown as Env['DB'],MAIL_OBJECTS:{put:async(key:string)=>{objects.push(key);},delete:async()=>{},get:async()=>null} as unknown as Env['MAIL_OBJECTS'],TOKEN_ENCRYPTION_KEY:key,GOOGLE_CLIENT_ID:'client',GOOGLE_CLIENT_SECRET:'secret'}));
+    expect(objects.some(key=>key.endsWith('/text'))).toBe(true);expect(sqls.some(sql=>sql.includes("SET ingest_status='ready'"))).toBe(true);expect(sqls.some(sql=>sql.includes("SET committed_cursor=?"))).toBe(true);
+  });
 });
+
 

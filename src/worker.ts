@@ -2,6 +2,7 @@ import { accessSubject } from './access';
 import { MIME_LIMITS, parseMime, type ParsedAttachment } from './ingestion/mime';
 import { sanitizeEmailHtml } from './security/sanitize-html';
 import { decryptSecret, encryptSecret, randomSecret, sha256Hex } from './security/crypto';
+import { GmailApiError, getGmailMessageLabels, getRawGmailMessage, gmailProfile, listGmailHistory, listInboxMessages, refreshGmailAccessToken } from './providers/gmail';
 export interface Env {
   DB: { prepare(query: string): { bind(...values: unknown[]): { first<T>(): Promise<T | null>; all<T>(): Promise<{results?: T[]}>; run(): Promise<{meta?: {changes?: number}}> } }; batch(statements: unknown[]): Promise<unknown[]> };
   MAIL_OBJECTS: { put(key: string, value: ArrayBuffer | ArrayBufferView | string, options?: { httpMetadata?: { contentType?: string } }): Promise<unknown>; get(key: string): Promise<{text(): Promise<string>; arrayBuffer(): Promise<ArrayBuffer>} | null>; delete(keys: string | string[]): Promise<unknown> };
@@ -140,6 +141,55 @@ async function runScheduled(env: Env) {
       await env.DB.prepare('UPDATE jobs SET status=?,available_at_ms=?,lease_token=NULL,lease_expires_at_ms=NULL,error_code=?,updated_at_ms=? WHERE id=? AND lease_token=?').bind(dead?'dead':'retry_wait',now+delay,'CLEANUP_FAILED',Date.now(),job.id,lease).run();
     }
   }
+  const accounts=await env.DB.prepare("SELECT id,user_id FROM provider_accounts WHERE provider='gmail' AND auth_status='connected' AND (next_sync_at_ms IS NULL OR next_sync_at_ms<=?) AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms<=?) LIMIT 10").bind(now,now).all<{id:string;user_id:string}>();
+  for(const account of accounts.results??[]){
+    const jobId=crypto.randomUUID();await env.DB.prepare("INSERT OR IGNORE INTO jobs(id,user_id,kind,target_id,dedup_key,status,available_at_ms,created_at_ms,updated_at_ms) VALUES(?,?,'sync',?,'sync:'||?,'pending',?,?,?)").bind(jobId,account.user_id,account.id,account.id,now,now,now).run();
+    await env.DB.prepare("UPDATE provider_accounts SET sync_status='queued',next_sync_at_ms=? WHERE id=? AND user_id=? AND auth_status='connected'").bind(now+5*60_000,account.id,account.user_id).run();
+  }
+  const syncJobs=await env.DB.prepare("SELECT id,user_id,target_id,attempts,max_attempts FROM jobs WHERE kind='sync' AND status IN ('pending','retry_wait') AND available_at_ms<=? AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms<=?) ORDER BY created_at_ms LIMIT 2").bind(Date.now(),Date.now()).all<{id:string;user_id:string;target_id:string;attempts:number;max_attempts:number}>();
+  for(const job of syncJobs.results??[]){
+    const lease=crypto.randomUUID(),claimed=await env.DB.prepare("UPDATE jobs SET status='running',attempts=attempts+1,lease_token=?,lease_expires_at_ms=?,updated_at_ms=? WHERE id=? AND status IN ('pending','retry_wait') AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms<=?)").bind(lease,Date.now()+4*60_000,Date.now(),job.id,Date.now()).run();
+    if(claimed.meta?.changes!==1)continue;
+    try{await syncGmailAccount(env,job.target_id,job.user_id,job.id,lease);}
+    catch(failure){const invalidGrant=failure instanceof GmailApiError&&failure.reason==='invalid_grant',attempts=job.attempts+1,dead=invalidGrant||attempts>=job.max_attempts,at=Date.now();await env.DB.batch([env.DB.prepare("UPDATE jobs SET status=?,available_at_ms=?,lease_token=NULL,lease_expires_at_ms=NULL,error_code=?,updated_at_ms=? WHERE id=? AND lease_token=?").bind(dead?'dead':'retry_wait',at+Math.min(3600000,1000*2**attempts),invalidGrant?'GMAIL_REAUTH_REQUIRED':'GMAIL_SYNC_FAILED',at,job.id,lease),env.DB.prepare("UPDATE provider_accounts SET auth_status=?,sync_status=?,lease_token=NULL,lease_expires_at_ms=NULL WHERE id=? AND user_id=?").bind(invalidGrant?'reauth_required':'connected',invalidGrant?'blocked':'backoff',job.target_id,job.user_id)]);}
+  }
+}
+
+async function syncGmailAccount(env:Env,accountId:string,userId:string,jobId:string,jobLease:string){
+  if(!env.TOKEN_ENCRYPTION_KEY||!env.GOOGLE_CLIENT_ID||!env.GOOGLE_CLIENT_SECRET)throw new Error('GMAIL_SYNC_NOT_CONFIGURED');
+  const now=Date.now(),lease=crypto.randomUUID();
+  const locked=await env.DB.prepare("UPDATE provider_accounts SET lease_token=?,lease_expires_at_ms=?,sync_status='syncing' WHERE id=? AND user_id=? AND auth_status='connected' AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms<=?)").bind(lease,now+4*60_000,accountId,userId,now).run();
+  if(locked.meta?.changes!==1)throw new Error('GMAIL_ACCOUNT_BUSY');
+  const account=await env.DB.prepare("SELECT encrypted_refresh_token,key_version,committed_cursor,email_address FROM provider_accounts WHERE id=? AND user_id=? AND lease_token=?").bind(accountId,userId,lease).first<{encrypted_refresh_token:string;key_version:string;committed_cursor:string|null;email_address:string}>();
+  if(!account)throw new Error('GMAIL_ACCOUNT_NOT_FOUND');
+  const refresh=await decryptSecret(account.encrypted_refresh_token,env.TOKEN_ENCRYPTION_KEY,`provider-account:${userId}:${accountId}:gmail`);
+  const access=await refreshGmailAccessToken(refresh,env.GOOGLE_CLIENT_ID,env.GOOGLE_CLIENT_SECRET),profile=await gmailProfile(access.access_token);
+  let ids:string[]=[],removed=new Set<string>(),committedCursor=account.committed_cursor??profile.historyId;
+  if(account.committed_cursor){let page:string|undefined;for(let n=0;n<10;n++){let history;try{history=await listGmailHistory(access.access_token,account.committed_cursor,page);}catch(e){if(e instanceof GmailApiError&&e.status===404){await env.DB.prepare('UPDATE provider_accounts SET committed_cursor=NULL,sync_generation=sync_generation+1 WHERE id=? AND user_id=? AND lease_token=?').bind(accountId,userId,lease).run();}throw e;}committedCursor=history.historyId;ids.push(...(history.history??[]).flatMap(item=>(item.messagesAdded??[]).map(event=>event.message.id)));for(const event of (history.history??[]).flatMap(item=>[...(item.messagesDeleted??[]).map(e=>e.message.id),...(item.labelsRemoved??[]).filter(e=>e.labelIds.includes('INBOX')).map(e=>e.message.id)]))removed.add(event);page=history.nextPageToken;if(!page)break;if(n===9)throw new Error('GMAIL_HISTORY_PAGE_LIMIT');}}
+  else{let page:string|undefined;for(let n=0;n<2;n++){const result=await listInboxMessages(access.access_token,Math.floor((now-7*86400000)/1000),100,page);ids.push(...(result.messages??[]).map(item=>item.id));page=result.nextPageToken;if(!page)break;}}
+  if(ids.length>200)throw new Error('GMAIL_SYNC_BATCH_LIMIT');
+  for(const messageId of [...new Set(ids)].slice(0,200)){const labels=await getGmailMessageLabels(access.access_token,messageId);if(labels.labelIds?.includes('INBOX'))await ingestGmailMessage(env,accountId,userId,lease,account.email_address,messageId,access.access_token);}
+  for(const messageId of removed)await deleteCachedGmailMessage(env,accountId,userId,messageId);
+  await env.DB.batch([env.DB.prepare("UPDATE provider_accounts SET committed_cursor=?,last_synced_at_ms=?,next_sync_at_ms=?,sync_status='idle',lease_token=NULL,lease_expires_at_ms=NULL WHERE id=? AND user_id=? AND lease_token=?").bind(committedCursor,Date.now(),Date.now()+5*60_000,accountId,userId,lease),env.DB.prepare("UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at_ms=NULL,error_code=NULL,updated_at_ms=? WHERE id=? AND lease_token=?").bind(Date.now(),jobId,jobLease)]);
+}
+
+async function ingestGmailMessage(env:Env,accountId:string,userId:string,lease:string,emailAddress:string,messageId:string,accessToken:string){
+  const prior=await env.DB.prepare('SELECT id,ingest_status FROM emails WHERE provider_account_id=? AND provider_message_id=?').bind(accountId,messageId).first<{id:string;ingest_status:string}>();
+  if(prior?.ingest_status==='ready')return;
+  const remote=await getRawGmailMessage(accessToken,messageId),parsed=await parseMime(remote.bytes,emailAddress),id=prior?.id??crypto.randomUUID(),now=Date.now();
+  const objects:Array<{id:string;key:string;kind:string;value:Uint8Array;type:string}>=[];
+  if(parsed.text)objects.push({id:`${id}-text`,key:`gmail/${accountId}/${id}/text`,kind:'text',value:new TextEncoder().encode(parsed.text),type:'text/plain; charset=utf-8'});
+  if(parsed.html)objects.push({id:`${id}-html`,key:`gmail/${accountId}/${id}/html`,kind:'html',value:new TextEncoder().encode(parsed.html),type:'text/html; charset=utf-8'});
+  await env.DB.batch([env.DB.prepare("INSERT OR IGNORE INTO emails(id,user_id,source,provider_account_id,provider_message_id,message_id_header,from_address,to_addresses_json,subject,snippet,received_at_ms,created_at_ms,otp_candidates_json,ingest_status,source_generation,body_truncated) SELECT ?,?,'gmail',?,?,?,?,?,?,?,?,?,?,'staged',?,? FROM provider_accounts WHERE id=? AND user_id=? AND lease_token=?").bind(id,userId,accountId,messageId,parsed.messageId,parsed.from,JSON.stringify(parsed.to),parsed.subject,parsed.snippet,parsed.receivedAt,now,JSON.stringify(parsed.otpCandidates),0,parsed.bodyTruncated?1:0,accountId,userId,lease),...objects.map(o=>env.DB.prepare("INSERT OR IGNORE INTO mail_objects(id,email_id,kind,object_key,size_bytes,status,created_at_ms) VALUES(?,?,?,?,?,'expected',?)").bind(o.id,id,o.kind,o.key,o.value.byteLength,now)),...parsed.attachments.map((item,index)=>env.DB.prepare('INSERT OR IGNORE INTO email_attachments(id,email_id,object_id,filename,content_type,size_bytes,skipped_reason) VALUES(?,?,NULL,?,?,?,?)').bind(`${id}-att-${index}`,id,item.filename,item.contentType,item.skippedReason??'gmail_attachment_deferred',item.skippedReason===null?item.bytes.byteLength:item.size))]);
+  for(const obj of objects){await env.MAIL_OBJECTS.put(obj.key,obj.value,{httpMetadata:{contentType:obj.type}});await env.DB.prepare("UPDATE mail_objects SET status='uploaded',checksum_sha256=? WHERE id=?").bind(await sha256(obj.value),obj.id).run();}
+  const finalized=await env.DB.prepare("UPDATE emails SET ingest_status='ready' WHERE id=? AND user_id=? AND ingest_status='staged' AND EXISTS(SELECT 1 FROM provider_accounts WHERE id=? AND lease_token=? AND auth_status='connected')").bind(id,userId,accountId,lease).run();
+  if(finalized.meta?.changes!==1)throw new Error('GMAIL_EMAIL_FINALIZE_FAILED');
+}
+
+async function deleteCachedGmailMessage(env:Env,accountId:string,userId:string,messageId:string){
+  const email=await env.DB.prepare('SELECT id FROM emails WHERE provider_account_id=? AND user_id=? AND provider_message_id=?').bind(accountId,userId,messageId).first<{id:string}>();if(!email)return;
+  const objects=await env.DB.prepare('SELECT object_key AS objectKey FROM mail_objects WHERE email_id=?').bind(email.id).all<{objectKey:string}>();for(const object of objects.results??[])await env.MAIL_OBJECTS.delete(object.objectKey);
+  await env.DB.batch([env.DB.prepare('DELETE FROM email_attachments WHERE email_id=?').bind(email.id),env.DB.prepare('DELETE FROM mail_objects WHERE email_id=?').bind(email.id),env.DB.prepare('DELETE FROM emails WHERE id=? AND user_id=?').bind(email.id,userId)]);
 }
 
 async function cleanupMailbox(env: Env, mailboxId: string, userId: string, jobId: string, lease: string, now: number) {
@@ -189,6 +239,18 @@ const worker = {
     if(url.pathname==='/api/v1/accounts'&&request.method==='GET'){
       const result=await env.DB.prepare('SELECT id,provider,email_address AS emailAddress,auth_status AS authStatus,sync_status AS syncStatus,last_synced_at_ms AS lastSyncedAt FROM provider_accounts WHERE user_id=? ORDER BY created_at_ms DESC').bind(owner).all<Record<string,unknown>>();
       return json({accounts:result.results??[]});
+    }
+    const syncPath=url.pathname.match(/^\/api\/v1\/accounts\/([0-9a-f-]{36})\/sync$/i);
+    if(syncPath&&request.method==='POST'){
+      if(!sameOrigin(request))return error('CSRF_REJECTED','Same-origin request required',403);
+      const account=await env.DB.prepare("SELECT id,auth_status,sync_status FROM provider_accounts WHERE id=? AND user_id=? AND provider='gmail'").bind(syncPath[1],owner).first<{id:string;auth_status:string;sync_status:string}>();
+      if(!account)return error('NOT_FOUND','Gmail account not found',404);
+      if(account.auth_status!=='connected')return error('GMAIL_REAUTH_REQUIRED','Gmail authorization is not active',409);
+      const now=Date.now(),jobId=crypto.randomUUID();
+      await env.DB.prepare("INSERT OR IGNORE INTO jobs(id,user_id,kind,target_id,dedup_key,status,available_at_ms,created_at_ms,updated_at_ms) VALUES(?,?,'sync',?,'sync:'||?,'pending',?,?,?)").bind(jobId,owner,account.id,account.id,now,now,now).run();
+      const job=await env.DB.prepare("SELECT id,status FROM jobs WHERE dedup_key=? AND status IN ('pending','running','retry_wait')").bind(`sync:${account.id}`).first<{id:string;status:string}>();
+      await env.DB.prepare("UPDATE provider_accounts SET sync_status='queued' WHERE id=? AND user_id=? AND auth_status='connected'").bind(account.id,owner).run();
+      return json({jobId:job?.id??jobId,status:job?.status??'pending'},202);
     }
     if(url.pathname==='/api/v1/accounts/gmail/connect'&&request.method==='POST'){
       if(!sameOrigin(request))return error('CSRF_REJECTED','Same-origin request required',403);
