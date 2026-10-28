@@ -3,6 +3,10 @@ main = "src/worker.ts"
 compatibility_date = "2026-10-26"
 workers_dev = false
 
+[[routes]]
+pattern = "ear1.de5.net"
+custom_domain = true
+
 [assets]
 directory = "./dist/client"
 binding = "ASSETS"
@@ -24,4 +28,7 @@ crons = ["*/1 * * * *"]
 
 [vars]
 APP_ENV = "production"
-MAIL_DOMAIN = "inbox.example.invalid"
+APP_BASE_URL = "https://ear1.de5.net"
+MAIL_DOMAIN = "ear1.de5.net"
+ACCESS_TEAM_DOMAIN = "huangshu007.cloudflareaccess.com"
+ACCESS_AUD = "ea0c296fbcb2cfbfe6507372a44870ba2cd3dd5ca1b79e4c106b824d581151b2"
