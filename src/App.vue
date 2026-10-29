@@ -89,22 +89,31 @@ onUnmounted(()=>{if(refreshTimer)clearInterval(refreshTimer);if(searchTimer)clea
       </template>
       <template v-else-if="page==='temporary'">
         <section class="page-title"><div><p class="eyebrow">TEMPORARY ADDRESSES</p><h1>短暂的地址，完整的掌控。</h1><p>创建 MailHub 自有地址，或使用 temp-mail.io 的临时邮箱。</p></div></section>
-        <div class="info-banner">MailHub 地址由本服务接收；temp-mail.io 地址由外部服务接收。临时地址到期后停止读取。</div>
-        <section class="cards">
-          <article class="card empty-card temp-mail-create-card">
-            <div class="pill-icon">＋</div><h3>创建 temp-mail.io 邮箱</h3><p>随机地址可立即创建；也可以自定义名称和域名。</p>
-            <button class="button primary" :disabled="busy" @click="createTempMailIoMailbox(false)">{{ busy?'正在创建…':'创建随机地址' }}</button>
-            <button class="text-button" :disabled="busy" @click="showTempMailCustomForm=!showTempMailCustomForm;showTempMailCustomForm&&!tempMailDomains.length&&loadTempMailDomains()">{{ showTempMailCustomForm?'收起自定义地址':'自定义地址' }}</button>
-            <div v-if="showTempMailCustomForm" class="temp-mail-custom-form">
-              <label><span>自定义名称</span><input v-model="tempMailName" maxlength="31" autocomplete="off" placeholder="例如 my-account"></label>
-              <label><span>域名</span><select v-model="tempMailDomain" :disabled="!tempMailDomains.length"><option v-for="domain in tempMailDomains" :key="domain" :value="domain">{{ domain }}</option></select></label>
-              <button class="button small" :disabled="busy||!tempMailDomains.length" @click="createTempMailIoMailbox(true)">创建自定义地址</button>
-              <button class="text-button" :disabled="tempMailDomainsLoading" @click="loadTempMailDomains">{{ tempMailDomainsLoading?'正在读取…':'刷新域名' }}</button>
-              <small v-if="!tempMailDomains.length" class="temp-provider-note">{{ tempMailDomainsLoading?'正在读取可用域名…':'域名暂不可用，可稍后刷新；随机地址仍可尝试创建。' }}</small>
-            </div>
+        <section class="card temporary-tools">
+          <div class="temporary-create-actions">
+            <button class="button primary" :disabled="busy" @click="createMailbox">＋ MailHub 邮箱</button>
+            <button class="button" :disabled="busy" @click="createTempMailIoMailbox(false)">＋ 随机临时邮箱</button>
+            <button class="button" :disabled="busy" @click="showTempMailCustomForm=!showTempMailCustomForm;showTempMailCustomForm&&!tempMailDomains.length&&loadTempMailDomains()">{{ showTempMailCustomForm?'收起自定义地址':'＋ 自定义地址' }}</button>
+            <button class="text-button domain-refresh" :disabled="tempMailDomainsLoading" @click="loadTempMailDomains">{{ tempMailDomainsLoading?'正在读取域名…':'刷新域名' }}</button>
+          </div>
+          <div v-if="showTempMailCustomForm" class="temp-mail-custom-form">
+            <label><span>自定义名称</span><input v-model="tempMailName" maxlength="31" autocomplete="off" placeholder="例如 my-account"></label>
+            <label><span>域名</span><select v-model="tempMailDomain" :disabled="!tempMailDomains.length"><option v-for="domain in tempMailDomains" :key="domain" :value="domain">{{ domain }}</option></select></label>
+            <button class="button small primary" :disabled="busy||!tempMailDomains.length" @click="createTempMailIoMailbox(true)">创建自定义邮箱</button>
+            <small v-if="!tempMailDomains.length" class="temp-provider-note">{{ tempMailDomainsLoading?'正在读取可用域名…':'域名暂不可用，可稍后刷新；随机地址仍可尝试创建。' }}</small>
+          </div>
+          <p class="temporary-tools-note">MailHub 地址由本服务接收；temp-mail.io 地址由外部服务接收。</p>
+        </section>
+        <section class="mailbox-list">
+          <div class="mailbox-list-heading"><strong>邮箱列表</strong><span>{{ mailboxes.length }} 个</span></div>
+          <article v-for="box in mailboxes" :key="box.id" class="mailbox-row">
+            <span class="mailbox-row-icon" :class="box.provider==='temp_mail_io'?'external':'native'">{{ box.provider==='temp_mail_io'?'T':'M' }}</span>
+            <div class="mailbox-row-address"><strong>{{ box.address }}</strong><small>{{ box.provider==='temp_mail_io'?'temp-mail.io':'MailHub' }}</small></div>
+            <span class="status-badge" :class="box.status">{{ box.status==='active'?'接收中':box.status==='deleting'?'清理中':'已到期' }}</span>
+            <div class="mailbox-row-expiry"><strong>{{ box.status==='active'?expiry(box.expiresAt):'不可读取' }}</strong><small>到期 {{ date(box.expiresAt) }}</small></div>
+            <div class="mailbox-row-actions"><button class="button small" @click="copyValue(box.address)">复制</button><button class="button small" :disabled="box.status!=='active'" @click="viewMailbox(box)">查看邮件</button><button class="button small" :disabled="busy||box.status!=='active'" @click="renewMailbox(box)">续期</button><button class="button small danger" :disabled="busy||box.status==='deleting'" @click="deleteMailbox(box)">删除</button></div>
           </article>
-          <article v-for="box in mailboxes" :key="box.id" class="card mailbox-card"><div class="card-head"><span class="pill-icon">◷</span><span class="status-badge" :class="box.status">{{ box.status==='active'?'接收中':box.status==='deleting'?'清理中':'已到期' }}</span></div><div class="email-address">{{ box.address }}</div><div class="key-value"><span>邮箱服务</span><b>{{ box.provider==='temp_mail_io'?'temp-mail.io':'MailHub' }}</b></div><div class="progress"><i :style="{width:box.status==='active'?`${Math.max(0,Math.min(100,(box.expiresAt-Date.now())/(box.expiresAt-box.createdAt)*100))}%`:'0%'}"></i></div><div class="key-value"><span>剩余时间</span><b>{{ box.status==='active'?expiry(box.expiresAt):'不可读取' }}</b></div><div class="key-value"><span>到期时间</span><b>{{ date(box.expiresAt) }}</b></div><div class="key-value"><span>关联邮件</span><b>{{ emails.filter(email=>email.mailboxId===box.id).length }} 封（已加载）</b></div><div class="card-actions"><button class="button small" @click="copyValue(box.address)">复制地址</button><button class="button small" :disabled="box.status!=='active'" @click="viewMailbox(box)">查看邮件</button><button class="button small" :disabled="busy||box.status!=='active'" @click="renewMailbox(box)">延长 60 分钟</button><button class="button small danger" :disabled="busy||box.status==='deleting'" @click="deleteMailbox(box)">删除</button></div></article>
-          <article v-if="!mailboxes.some(box=>box.provider!=='temp_mail_io')" class="card empty-card"><div class="pill-icon">＋</div><h3>还没有 MailHub 邮箱</h3><p>创建一个由 MailHub 自己接收邮件的私有地址。</p><button class="button primary" :disabled="busy" @click="createMailbox">创建 MailHub 邮箱</button></article>
+          <div v-if="!mailboxes.length" class="mailbox-list-empty"><strong>还没有邮箱</strong><span>使用上方按钮创建 MailHub 邮箱或临时邮箱。</span></div>
         </section>
       </template>
 
