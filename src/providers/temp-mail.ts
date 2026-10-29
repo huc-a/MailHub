@@ -18,11 +18,11 @@ function errorCode(body:unknown){
 }
 async function request(path:string,init:RequestInit={},cookie=''){
   const headers=new Headers(init.headers);
-  headers.set('Content-Type','application/json');headers.set('Application-Name','web');headers.set('Application-Version',APP_VERSION);headers.set('X-CORS-Header','1');headers.set('Origin','https://temp-mail.io');headers.set('Referer','https://temp-mail.io/');headers.set('User-Agent',USER_AGENT);
+  headers.set('Accept','application/json');headers.set('Content-Type','application/json');headers.set('Application-Name','web');headers.set('Application-Version',APP_VERSION);headers.set('X-CORS-Header','1');headers.set('Origin','https://temp-mail.io');headers.set('Referer','https://temp-mail.io/');headers.set('User-Agent',USER_AGENT);
   if(cookie)headers.set('Cookie',cookie);
   let response:Response|undefined;
   for(let attempt=0;attempt<4;attempt++){
-    try{response=await fetch(`${API_BASE}${path}`,{...init,headers,redirect:'error'});break;}catch{if(attempt===3)throw new TempMailApiError(502,'NETWORK_ERROR');await new Promise(resolve=>setTimeout(resolve,750*(attempt+1)));}
+    try{response=await fetch(`${API_BASE}${path}`,{...init,headers,redirect:'follow'});break;}catch{if(attempt===3)throw new TempMailApiError(502,'NETWORK_ERROR');await new Promise(resolve=>setTimeout(resolve,750*(attempt+1)));}
   }
   if(!response)throw new TempMailApiError(502,'NETWORK_ERROR');
   const setCookie=responseCookies(response);let body:unknown=null;const text=await response.text();if(text){try{body=JSON.parse(text);}catch{body=null;}}

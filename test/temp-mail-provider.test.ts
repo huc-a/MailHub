@@ -9,6 +9,8 @@ describe('temp-mail.io provider adapter',()=>{
     vi.stubGlobal('fetch',vi.fn(async(input:RequestInfo|URL,init?:RequestInit)=>{request=new Request(input,init);return Response.json({domains:[{name:'example.test',type:'public'},{name:'private.test',type:'private'},{name:'bad domain',type:'public'}]});}));
     expect(await tempMailDomains()).toEqual(['example.test']);
     expect(request?.headers.get('Application-Version')).toBe('4.0.0');
+    expect(request?.headers.get('Accept')).toBe('application/json');
+    expect(request?.redirect).toBe('follow');
     expect(request?.url).toBe('https://api.internal.temp-mail.io/api/v4/domains');
   });
   it('creates random and custom addresses and keeps the upstream cookie session',async()=>{
