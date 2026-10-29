@@ -1,8 +1,16 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import worker, { type Env } from '../src/worker';
+import worker, { syncFailureCode, type Env } from '../src/worker';
 import { encryptSecret } from '../src/security/crypto';
 
 afterEach(()=>vi.unstubAllGlobals());
+
+describe('provider sync diagnostics',()=>{
+  it('classifies IMAP authentication and folder failures without exposing server text',()=>{
+    expect(syncFailureCode(new Error('IMAP_COMMAND_FAILED:A0002 NO [AUTHENTICATIONFAILED] private details'),'forwarded_imap')).toBe('IMAP_AUTHENTICATION_FAILED');
+    expect(syncFailureCode(new Error('IMAP_COMMAND_FAILED:A0002 NO [TRYCREATE] private details'),'forwarded_imap')).toBe('IMAP_FOLDER_NOT_FOUND');
+    expect(syncFailureCode(new Error('IMAP_SOCKET_CLOSED'),'forwarded_imap')).toBe('IMAP_SOCKET_CLOSED');
+  });
+});
 
 const env = (overrides: Partial<Env> = {}) => ({
   APP_ENV: 'production', MAIL_DOMAIN: 'mail.test', MAIL_OBJECTS: {},

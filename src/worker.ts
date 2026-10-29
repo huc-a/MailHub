@@ -155,9 +155,22 @@ async function runScheduled(env: Env) {
   for(const job of syncJobs.results??[]){
     const lease=crypto.randomUUID(),claimed=await env.DB.prepare("UPDATE jobs SET status='running',attempts=attempts+1,lease_token=?,lease_expires_at_ms=?,updated_at_ms=? WHERE id=? AND status IN ('pending','retry_wait','running') AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms<=?)").bind(lease,Date.now()+4*60_000,Date.now(),job.id,Date.now()).run();
     if(claimed.meta?.changes!==1)continue;
-    try{const account=await env.DB.prepare('SELECT sync_scope_json AS syncScope FROM provider_accounts WHERE id=? AND user_id=?').bind(job.target_id,job.user_id).first<{syncScope:string}>();const scope=JSON.parse(account?.syncScope??'{}') as {connectionType?:string};if(scope.connectionType==='forwarded_imap')await syncForwardedImapAccount(env,job.target_id,job.user_id,job.id,lease);else await syncGmailAccount(env,job.target_id,job.user_id,job.id,lease);}
-    catch(failure){const invalidGrant=failure instanceof GmailApiError&&failure.reason==='invalid_grant',attempts=job.attempts+1,dead=invalidGrant||attempts>=job.max_attempts,at=Date.now();await env.DB.batch([env.DB.prepare("UPDATE jobs SET status=?,available_at_ms=?,lease_token=NULL,lease_expires_at_ms=NULL,error_code=?,updated_at_ms=? WHERE id=? AND lease_token=?").bind(dead?'dead':'retry_wait',at+Math.min(3600000,1000*2**attempts),invalidGrant?'GMAIL_REAUTH_REQUIRED':'GMAIL_SYNC_FAILED',at,job.id,lease),env.DB.prepare("UPDATE provider_accounts SET auth_status=?,sync_status=?,lease_token=NULL,lease_expires_at_ms=NULL WHERE id=? AND user_id=?").bind(invalidGrant?'reauth_required':'connected',invalidGrant?'blocked':'backoff',job.target_id,job.user_id)]);}
+    let connectionType='gmail_oauth';
+    try{const account=await env.DB.prepare('SELECT sync_scope_json AS syncScope FROM provider_accounts WHERE id=? AND user_id=?').bind(job.target_id,job.user_id).first<{syncScope:string}>();const scope=JSON.parse(account?.syncScope??'{}') as {connectionType?:string};connectionType=scope.connectionType??connectionType;if(connectionType==='forwarded_imap')await syncForwardedImapAccount(env,job.target_id,job.user_id,job.id,lease);else await syncGmailAccount(env,job.target_id,job.user_id,job.id,lease);}
+    catch(failure){const invalidGrant=failure instanceof GmailApiError&&failure.reason==='invalid_grant',attempts=job.attempts+1,dead=invalidGrant||attempts>=job.max_attempts,at=Date.now(),failureCode=syncFailureCode(failure,connectionType);console.error('MailHub provider sync failed',JSON.stringify({accountId:job.target_id,connectionType,failureCode}));await env.DB.batch([env.DB.prepare("UPDATE jobs SET status=?,available_at_ms=?,lease_token=NULL,lease_expires_at_ms=NULL,error_code=?,updated_at_ms=? WHERE id=? AND lease_token=?").bind(dead?'dead':'retry_wait',at+Math.min(3600000,1000*2**attempts),invalidGrant?'GMAIL_REAUTH_REQUIRED':failureCode,at,job.id,lease),env.DB.prepare("UPDATE provider_accounts SET auth_status=?,sync_status=?,lease_token=NULL,lease_expires_at_ms=NULL WHERE id=? AND user_id=?").bind(invalidGrant?'reauth_required':'connected',invalidGrant?'blocked':'backoff',job.target_id,job.user_id)]);}
   }
+}
+
+export function syncFailureCode(failure:unknown,connectionType:string){
+  const message=failure instanceof Error?failure.message:'UNKNOWN_ERROR';
+  if(connectionType==='forwarded_imap'){
+    const serverCode=message.match(/\[([A-Z0-9_-]{2,40})\]/i)?.[1]?.toUpperCase();
+    if(serverCode==='AUTHENTICATIONFAILED')return 'IMAP_AUTHENTICATION_FAILED';
+    if(serverCode==='TRYCREATE')return 'IMAP_FOLDER_NOT_FOUND';
+    const code=message.split(':',1)[0].replace(/[^A-Z0-9_]/gi,'').toUpperCase();
+    return code.startsWith('IMAP_')?code:'IMAP_SYNC_FAILED';
+  }
+  return failure instanceof GmailApiError&&failure.reason==='invalid_grant'?'GMAIL_REAUTH_REQUIRED':'GMAIL_SYNC_FAILED';
 }
 
 async function syncForwardedImapAccount(env:Env,accountId:string,userId:string,jobId:string,jobLease:string){
@@ -299,7 +312,7 @@ const worker = {
       return json({job:updated},202);
     }
     if(url.pathname==='/api/v1/accounts'&&request.method==='GET'){
-      const result=await env.DB.prepare("SELECT id,provider,email_address AS emailAddress,auth_status AS authStatus,sync_status AS syncStatus,last_synced_at_ms AS lastSyncedAt,COALESCE(json_extract(sync_scope_json,'$.connectionType'),'gmail_oauth') AS connectionType,json_extract(sync_scope_json,'$.imapProvider') AS imapProvider,json_extract(sync_scope_json,'$.folders') AS folders FROM provider_accounts WHERE user_id=? ORDER BY created_at_ms DESC").bind(owner).all<Record<string,unknown>>();
+      const result=await env.DB.prepare("SELECT id,provider,email_address AS emailAddress,auth_status AS authStatus,sync_status AS syncStatus,last_synced_at_ms AS lastSyncedAt,(SELECT error_code FROM jobs WHERE kind='sync' AND target_id=provider_accounts.id AND user_id=provider_accounts.user_id ORDER BY updated_at_ms DESC LIMIT 1) AS syncError,COALESCE(json_extract(sync_scope_json,'$.connectionType'),'gmail_oauth') AS connectionType,json_extract(sync_scope_json,'$.imapProvider') AS imapProvider,json_extract(sync_scope_json,'$.folders') AS folders FROM provider_accounts WHERE user_id=? ORDER BY created_at_ms DESC").bind(owner).all<Record<string,unknown>>();
       return json({accounts:result.results??[]});
     }
     if(url.pathname==='/api/v1/accounts/forwarded-imap/folders'&&request.method==='POST'){
