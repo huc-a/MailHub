@@ -19,7 +19,7 @@ describe('forwarded IMAP provider',()=>{
     finally{await client.close();}
   });
   it('resets its search cursor when the server changes UID validity',async()=>{const mock=mockServer(),client=await ImapClient.open('imap.qq.com',993,'hub@example.test','app-password',mock.factory);try{await client.fetchSince('Archive',99,10,'76');expect(mock.commands).toContain('UID SEARCH ALL');}finally{await client.close();}});
-  it('encodes Chinese QQ folder names as UTF-16BE modified UTF-7 before SELECT',async()=>{const mock=mockServer(),client=await ImapClient.open('imap.qq.com',993,'hub@example.test','app-password',mock.factory);try{await client.fetchSince('其他文件夹/huc.a5411@gmail.com',null,10);expect(mock.commands).toContain('SELECT "&UXZO1mWHTvZZOQ-/huc.a5411@gmail.com"');}finally{await client.close();}});
+  it('encodes Chinese QQ folder names as UTF-16BE modified UTF-7 before SELECT',async()=>{const mock=mockServer(),client=await ImapClient.open('imap.qq.com',993,'hub@example.test','app-password',mock.factory);try{await client.fetchSince('其他文件夹/user@example.test',null,10);expect(mock.commands).toContain('SELECT "&UXZO1mWHTvZZOQ-/user@example.test"');}finally{await client.close();}});
   it('refuses unsupported IMAP hosts and plaintext port',async()=>{
     await expect(ImapClient.open('127.0.0.1',993,'a@b.test','secret')).rejects.toThrow('IMAP_HOST_NOT_SUPPORTED');
     await expect(ImapClient.open('imap.qq.com',143,'a@b.test','secret')).rejects.toThrow('IMAP_PORT_NOT_SUPPORTED');

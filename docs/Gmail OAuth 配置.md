@@ -12,7 +12,7 @@ MailHub 已实现 Google OAuth 授权、只读 Gmail 同步、增量同步和 re
 6. 创建 OAuth Client，应用类型选 **Web application**。
 7. 在 Authorized redirect URIs 添加下面这个地址（必须完全一致）：
 
-   `https://ear1.de5.net/oauth/gmail/callback`
+   `https://YOUR_DOMAIN/oauth/gmail/callback`
 
 8. 保存并复制 Client ID 与 Client Secret。
 
@@ -42,7 +42,7 @@ npx wrangler secret list
 
 ## 3. 连接并启动同步
 
-1. 登录 [MailHub](https://ear1.de5.net/) 并打开 **邮箱连接**。
+1. 登录你部署的 MailHub 域名并打开 **邮箱连接**。
 2. 刷新页面，确认“Google OAuth 尚未配置”提示消失。
 3. 点击 **连接账号**，在 Google 页面选择账户并同意 Gmail 只读权限。
 4. 返回 MailHub 后，在 Gmail 卡片点击 **立即同步**。

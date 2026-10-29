@@ -168,7 +168,7 @@ describe('Worker API foundation', () => {
     const forwarded: string[] = [];
     const db = { prepare: () => ({ bind: () => ({ first: async () => null, all: async () => ({ results: [] }), run: async () => ({ meta: { changes: 0 } }) }) }), batch: async () => [] };
     const response = await worker.email({
-      to: 'legacy@ear1.de5.net',
+      to: 'legacy@mail.example.test',
       raw: new ReadableStream<Uint8Array>({ start(controller) { controller.close(); } }),
       rawSize: 0,
       setReject: reason => { throw new Error(`Unexpected rejection: ${reason}`); },

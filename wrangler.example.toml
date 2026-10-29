@@ -3,10 +3,6 @@ main = "src/worker.ts"
 compatibility_date = "2026-10-26"
 workers_dev = false
 
-[[routes]]
-pattern = "ear1.de5.net"
-custom_domain = true
-
 [assets]
 directory = "./dist/client"
 binding = "ASSETS"
@@ -16,7 +12,8 @@ not_found_handling = "single-page-application"
 [[d1_databases]]
 binding = "DB"
 database_name = "mailhub-dev"
-database_id = "d71b8456-203f-4da0-ad0b-5bab7e7fd915"
+# Replace this placeholder with the D1 database ID from your Cloudflare account.
+database_id = "00000000-0000-0000-0000-000000000001"
 migrations_dir = "migrations"
 
 [[r2_buckets]]
@@ -28,7 +25,8 @@ crons = ["*/1 * * * *"]
 
 [vars]
 APP_ENV = "production"
-APP_BASE_URL = "https://ear1.de5.net"
-MAIL_DOMAIN = "ear1.de5.net"
-ACCESS_TEAM_DOMAIN = "huangshu007.cloudflareaccess.com"
-ACCESS_AUD = "ea0c296fbcb2cfbfe6507372a44870ba2cd3dd5ca1b79e4c106b824d581151b2"
+APP_BASE_URL = "https://mail.example.com"
+MAIL_DOMAIN = "mail.example.com"
+# Configure these for your Cloudflare Access application before adding a route.
+# ACCESS_TEAM_DOMAIN = "your-team.cloudflareaccess.com"
+# ACCESS_AUD = "your-access-application-audience"

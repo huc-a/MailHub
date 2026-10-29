@@ -1,30 +1,109 @@
 # MailHub
 
-基于实施文档 v2.0 的 Cloudflare 私有邮箱工作台，目前按单所有者模式开发。
+MailHub 是一个运行在 Cloudflare 上的个人邮箱工作台，提供统一收件箱、转发邮箱同步和临时邮箱管理。项目使用 Cloudflare Workers 运行 API，D1 保存邮件索引与配置，R2 保存邮件正文和附件。
+
+## 功能
+
+- **统一收件箱**：汇总邮件来源，支持搜索、未读筛选和分页。
+- **转发汇总邮箱**：通过 IMAP 读取 Gmail、QQ 等邮箱中的转发邮件，并按来源文件夹归类。
+- **临时邮箱**：创建 MailHub 自有地址，或创建 temp-mail.io 随机/自定义地址；支持收件同步、验证码识别、复制地址、续期和删除。
+- **邮件详情**：D1/R2 分层存储邮件信息与正文，提取验证码和邮件链接；HTML 正文经过净化并在隔离 iframe 中显示。
+- **Gmail OAuth**：提供只读 OAuth/PKCE 和增量同步实现；连接前需配置自己的 Google Cloud OAuth 客户端。
+- **访问保护**：生产 API 使用 Cloudflare Access 身份校验。
+
+## 技术栈
+
+- Vue 3、TypeScript、Vite
+- Cloudflare Workers、D1、R2、Email Routing、Access
+- Vitest、Wrangler
+
+## 项目结构
+
+```text
+src/
+  providers/       Gmail、IMAP 和 temp-mail.io 适配器
+  security/        Access 身份校验、加密与 HTML 净化
+  ingestion/       MIME 邮件解析
+  worker.ts        Worker API、定时任务和邮件路由
+  App.vue          前端工作台
+migrations/        D1 schema 迁移
+test/              单元与 Worker API 测试
+docs/              配置说明、实施文档和 UI 原型
+wrangler.example.toml  Cloudflare 配置模板
+```
 
 ## 本地开发
 
-1. `npm install`
-2. 将 `.dev.vars.example` 复制为 `.dev.vars`。本地模拟身份只用于开发，禁止在生产环境启用。
-3. `npx wrangler d1 migrations apply mailhub-dev --local`
-4. `npm run dev` 或 `npx wrangler dev`
-5. `npm test`、`npm run build`
+需要安装 Node.js 20 或更高版本及 npm。
 
-本地 API 请求使用 `X-MailHub-Local-Subject` 模拟 Access 身份。生产 API 必须配置 Cloudflare Access，并设置 `ACCESS_TEAM_DOMAIN`、`ACCESS_AUD`。
+```powershell
+npm ci
+Copy-Item .dev.vars.example .dev.vars
+Copy-Item wrangler.example.toml wrangler.toml
+```
 
-## 当前实现
+首次使用请按实际环境编辑本地 `wrangler.toml`，至少为 D1 填入数据库 ID，并确认 R2 bucket 名称。`.dev.vars` 仅用于本机开发；其中的 `ALLOW_LOCAL_AUTH=true` 允许通过本地请求头模拟用户，**不得部署到生产环境**。
 
-- Cloudflare Worker、Vue 前端、D1/R2 绑定和 D1 初始迁移。
-- 临时邮箱支持 MailHub 自有地址及 temp-mail.io 随机/自定义地址；上游会话凭据加密保存，收到的邮件导入 D1/R2 并复用统一收件箱详情、验证码与链接提取。支持到期自动重建、续期、逻辑删除和过期清理。
-- Cloudflare Access JWT 校验、邮件列表/详情/本地已读、授权附件下载。
-- 收件箱按邮箱、来源、已读状态筛选；按主题/发件人搜索，并使用稳定游标继续加载较早邮件。
-- MIME 大小限制、正文/附件限额、D1/R2 分阶段入库、HTML 净化和 CSP 隔离。
-- Gmail 只读 OAuth/PKCE、Access Token 交换、加密保存 refresh token，只读 Gmail API 提供器、初次窗口同步、History 增量任务和账号租约。附件暂不从 Gmail 同步。
+```powershell
+npx wrangler d1 migrations apply mailhub-dev --local
+npm run dev
+```
 
-## Cloudflare 资源
+另开终端执行质量检查：
 
-生产站点：[https://ear1.de5.net](https://ear1.de5.net)，由 Cloudflare Access 限制为所有者邮箱。Worker 自定义域名和 Email Routing catch-all 已启用；有效临时邮箱收件入库，未命中地址继续转发到原已验证地址。MX、SPF、DKIM 记录保留。详情见 [生产收件路由](docs/生产收件路由.md)。
+```powershell
+npm test
+npm run typecheck
+npm run build
+```
 
-生产 Worker 当前绑定 D1 `mailhub-dev`（ID `d71b8456-203f-4da0-ad0b-5bab7e7fd915`）和 R2 bucket `mailhub-dev`；该账户资源仍是开发命名，尚未拆分独立 staging/prod 资源。Gmail OAuth 客户端和令牌加密密钥尚未配置，因此真实 Google 账号连接/同步暂不可用；Gmail 附件同步也尚未实现。
+测试使用模拟数据库、邮件服务器和上游接口；测试不会验证真实 Cloudflare 账户、真实 Gmail 或 temp-mail.io 收件。
 
-密钥请使用 Wrangler Secrets 或本地 `.dev.vars`，不得提交到 Git。生产 OAuth 至少需要 `APP_BASE_URL`、`GOOGLE_CLIENT_ID`、`GOOGLE_CLIENT_SECRET` 和 base64 编码的 32 字节 `TOKEN_ENCRYPTION_KEY`。
+## Cloudflare 配置
+
+`wrangler.example.toml` 不含生产域名和 Cloudflare 资源 ID。部署到自己的账户前：
+
+1. 创建 D1 数据库和 R2 bucket，并将名称及 D1 ID 写入本机 `wrangler.toml`。
+2. 配置自己的邮件域名、Worker 自定义域名和 Cloudflare Email Routing；如需将未匹配的邮件继续转发，设置 `FALLBACK_EMAIL` Secret。
+3. 先建立 Cloudflare Access 应用，再配置 Worker 变量 `ACCESS_TEAM_DOMAIN` 和 `ACCESS_AUD`。确保 Access 在 Worker 对公网开放前已启用。
+4. 在 `wrangler.toml` 中配置自己的 `MAIL_DOMAIN`、`APP_BASE_URL` 和 Worker route。
+5. 应用数据库迁移并部署：
+
+```powershell
+npx wrangler d1 migrations apply mailhub-dev --remote
+npx wrangler deploy
+```
+
+具体邮件路由流程见 [Cloudflare Email Routing 配置说明](docs/生产收件路由.md)。
+
+## Secrets 与敏感数据
+
+不要将密钥、`.dev.vars`、`.cloudflare.env`、本机 `wrangler.toml`、Cloudflare 本地状态或真实邮箱地址提交到 Git。生产密钥应通过 Wrangler Secrets 设置：
+
+```powershell
+npx wrangler secret put TOKEN_ENCRYPTION_KEY
+npx wrangler secret put GOOGLE_CLIENT_ID
+npx wrangler secret put GOOGLE_CLIENT_SECRET
+npx wrangler secret put FALLBACK_EMAIL
+```
+
+只为实际启用的功能设置对应 Secret。`TOKEN_ENCRYPTION_KEY` 必须是 32 个随机字节的 Base64，用于加密 D1 中保存的上游会话和 OAuth refresh token；丢失后，已有密文无法解密。生成命令：
+
+```powershell
+node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+```
+
+本地密钥示例见 `.dev.vars.example`。`wrangler.toml` 和 `.dev.vars` 已在 `.gitignore` 中排除；向 GitHub 推送前仍应检查暂存区和完整提交历史。
+
+## 已知限制
+
+- temp-mail.io 集成调用其网页使用的非公开接口；服务端接口或可用域名变化时，适配器可能需要更新。外部邮箱和邮件由该服务接收与保留。
+- Gmail 同步需要你自己的 Google OAuth 配置；Gmail 附件同步尚未实现。
+- 生产部署需要单独配置 Cloudflare 资源、Access、邮件路由和 Secrets；模板不会直接部署到任何账户。
+
+## 相关文档
+
+- [Gmail OAuth 配置](docs/Gmail%20OAuth%20配置.md)
+- [转发汇总邮箱连接](docs/转发汇总邮箱连接.md)
+- [Cloudflare Email Routing 配置](docs/生产收件路由.md)
+- [MailHub 实施文档](docs/MailHub_修订版实施文档.md)

@@ -1,6 +1,29 @@
+# Dependencies and build output
 node_modules/
 dist/
-.dev.vars
-.wrangler/
 coverage/
+.wrangler/
+
+# Local credentials and environment files
+.dev.vars*
+!.dev.vars.example
 .cloudflare.env
+.env
+.env.*
+!.env.example
+
+# Local Cloudflare account configuration; commit wrangler.example.toml instead
+/wrangler.toml
+/wrangler.*.local.toml
+
+# Local databases, logs, certificates, and OS files
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
+.DS_Store
+Thumbs.db
