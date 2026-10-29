@@ -49,7 +49,7 @@ export async function tempMailCreate(config:TempMailConfig={},cookie=''){
 export async function tempMailMessages(email:string,session:TempMailSession,retries=3,retryDelayMs=1500){
   for(let attempt=0;attempt<retries;attempt++){
     try{
-      const {body,cookie}=await request(`/v3/email/${encodeURIComponent(email)}/messages`,{},session.cookie);
+      const {body,cookie}=await request(`/v3/email/${email}/messages`,{},session.cookie);
       const messages=Array.isArray(body)?body:body&&typeof body==='object'&&Array.isArray((body as {messages?:unknown}).messages)?(body as {messages:unknown[]}).messages:[];
       return{messages:messages.filter((value):value is TempMailMessage=>Boolean(value&&typeof value==='object'&&typeof ((value as Record<string,unknown>).id??(value as Record<string,unknown>)._id)==='string')).map(value=>({...value,id:String(value.id??value._id)})),session:{...session,cookie}};
     }catch(failure){if(!isTempMailExpired(failure)||attempt===retries-1)throw failure;await new Promise(resolve=>setTimeout(resolve,retryDelayMs));}

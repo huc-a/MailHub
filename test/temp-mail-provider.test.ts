@@ -26,6 +26,7 @@ describe('temp-mail.io provider adapter',()=>{
     vi.stubGlobal('fetch',vi.fn(async(input:RequestInfo|URL,init?:RequestInit)=>{request=new Request(input,init);return Response.json([{id:'msg-1',subject:'Code'}]);}));
     const result=await tempMailMessages('abc@example.test',{token:'token',cookie:'sid=session-value'});
     expect(request?.headers.get('Cookie')).toBe('sid=session-value');
+    expect(request?.url).toBe('https://api.internal.temp-mail.io/api/v3/email/abc@example.test/messages');
     expect(result.messages).toEqual([{id:'msg-1',subject:'Code'}]);
     vi.stubGlobal('fetch',vi.fn(async()=>Response.json({code:101},{status:400})));
     await expect(tempMailMessages('abc@example.test',{token:'token',cookie:''},1)).rejects.toMatchObject({code:'MAILBOX_EXPIRED'} satisfies Partial<TempMailApiError>);
