@@ -71,6 +71,12 @@ describe('Worker API foundation', () => {
     const response=await worker.fetch(new Request('https://mailhub.test/api/v1/emails?folder='+encodeURIComponent('My Folders/person@example.net'),{headers:{'X-MailHub-Local-Subject':'owner'}}),env({APP_ENV:'local',ALLOW_LOCAL_AUTH:'true',DB:db as unknown as Env['DB']}));
     expect(response.status).toBe(200);expect(emailQuery).toContain('provider_account_id=?');expect(emailQuery).toContain('substr(provider_message_id,1,?)=?');expect(emailValues).toContain('hub-1');expect(emailValues).toContain('imap:My Folders/person@example.net:');expect(await response.json()).toMatchObject({emails:[{id:'mail-1',sourceFolder:'My Folders/person@example.net'}]});
   });
+  it('keeps the hub inbox available as a source for previously saved IMAP connections', async () => {
+    let emailQuery='',emailValues:unknown[]=[];
+    const db={prepare:(sql:string)=>({bind:(...values:unknown[])=>({first:async()=>({id:'owner-1'}),all:async()=>{if(sql.includes('FROM provider_accounts'))return{results:[{id:'hub-1',syncScope:JSON.stringify({connectionType:'forwarded_imap',folders:['My Folders/person@example.net']})}]};if(sql.includes('FROM emails WHERE')){emailQuery=sql;emailValues=values;}return{results:[]};},run:async()=>({meta:{changes:0}})})}),batch:async()=>[]};
+    const response=await worker.fetch(new Request('https://mailhub.test/api/v1/emails?source=forwarded&folder=INBOX',{headers:{'X-MailHub-Local-Subject':'owner'}}),env({APP_ENV:'local',ALLOW_LOCAL_AUTH:'true',DB:db as unknown as Env['DB']}));
+    expect(response.status).toBe(200);expect(emailQuery).toContain('provider_account_id=?');expect(emailValues).toContain('imap:INBOX:');
+  });
   it('limits all-forwarded view to configured hub accounts rather than OAuth Gmail', async () => {
     let emailQuery='',emailValues:unknown[]=[];
     const db={prepare:(sql:string)=>({bind:(...values:unknown[])=>({first:async()=>({id:'owner-1'}),all:async()=>{if(sql.includes('FROM provider_accounts'))return{results:[{id:'hub-1'},{id:'hub-2'}]};if(sql.includes('FROM emails WHERE')){emailQuery=sql;emailValues=values;}return{results:[]};},run:async()=>({meta:{changes:0}})})}),batch:async()=>[]};
