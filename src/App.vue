@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
+import { deriveMailTdAuthKey, randomMailTdLocalPart, randomMailTdPassword, solveMailTdPow } from './providers/mail-td-client';
 
 type Page = 'inbox' | 'temporary' | 'accounts' | 'settings';
-type Mailbox = { id:string; address:string; provider?:'native'|'temp_mail_io'; status:'active'|'expired'|'deleting'; createdAt:number; expiresAt:number };
+type Mailbox = { id:string; address:string; provider?:'native'|'temp_mail_io'|'mail_td'; status:'active'|'expired'|'deleting'; createdAt:number; expiresAt:number };
 type Email = { id:string; mailboxId:string|null; fromAddress:string; subject:string; snippet:string; receivedAt:number; localIsRead:number; source:string;sourceFolder?:string|null };
 type Detail = Email & { text:string; otpCandidates:string[]; bodyTruncated:boolean; hasHtml:boolean; attachments:Array<{id:string;filename:string;size:number;skippedReason:string|null}> };
 type Account = { id:string;provider:string;connectionType:string;emailAddress:string;authStatus:string;syncStatus:string;syncError?:string|null;imapProvider?:string;folders?:string[]|string };
@@ -21,6 +22,7 @@ const forwardedSettings=ref({provider:'qq',emailAddress:'',appPassword:'',folder
 const availableImapFolders=ref<ImapFolder[]>([]),selectedImapFolders=ref<string[]>([]);
 const showImapSetup=ref(false);
 const tempMailDomains=ref<string[]>([]),tempMailDomain=ref(''),tempMailName=ref(''),tempMailDomainsLoading=ref(false),showTempMailCustomForm=ref(false);
+const mailTdDomains=ref<string[]>([]),mailTdDomain=ref(''),mailTdName=ref(''),mailTdDomainsLoading=ref(false),showMailTdCustomForm=ref(false);
 const visibleEmails=computed(()=>selectedMailbox.value?emails.value.filter(e=>e.mailboxId===selectedMailbox.value):emails.value);
 const unreadCount=computed(()=>visibleEmails.value.filter(e=>!e.localIsRead).length);
 const unreadTotal=computed(()=>emails.value.filter(e=>!e.localIsRead).length);
@@ -40,7 +42,7 @@ const selectedSource=computed(()=>inboxSources.value.find(source=>source.key===s
 function categoryLabel(category:SourceCategory){return sourceCategories.find(item=>item.id===category)?.label??'邮箱';}
 function categoryCount(category:SourceCategory){return category==='all'?inboxSources.value.length:inboxSources.value.filter(source=>source.category===category).length;}
 let refreshTimer:number|undefined, searchTimer:number|undefined, inboxRequestId=0;
-async function api<T>(path:string, init:RequestInit={}):Promise<T>{const headers=new Headers(init.headers);if(init.body)headers.set('Content-Type','application/json');const response=await fetch(path,{...init,headers});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data?.error?.message??`请求失败 (${response.status})`);return data as T;}
+async function api<T>(path:string, init:RequestInit={}):Promise<T>{const headers=new Headers(init.headers);if(init.body)headers.set('Content-Type','application/json');const response=await fetch(path,{...init,headers});const data=await response.json().catch(()=>({}));if(!response.ok)throw Object.assign(new Error(data?.error?.message??`请求失败 (${response.status})`),{code:data?.error?.code,data});return data as T;}
 function emailListUrl(cursor?:string){const params=new URLSearchParams({limit:'10'});const source=selectedSource.value;if(source?.kind==='folder'){params.set('source','forwarded');params.set('folder',source.folder!);}else if(source?.kind==='provider')params.set('accountId',source.accountId!);else if(source?.kind==='temporary')params.set('mailboxId',source.mailboxId!);if(unreadFilter.value!=='all')params.set('unread',unreadFilter.value);if(search.value.trim())params.set('q',search.value.trim());if(cursor)params.set('cursor',cursor);return `/api/v1/emails?${params}`;}
 async function reload(){const requestId=++inboxRequestId;loadingMore.value=false;error.value='';try{const [m,a,g]=await Promise.all([api<{mailboxes:Mailbox[]}>('/api/v1/mailboxes'),api<{accounts:Account[]}>('/api/v1/accounts'),api<GmailSetup>('/api/v1/accounts/gmail/status')]);if(requestId!==inboxRequestId)return;mailboxes.value=m.mailboxes;accounts.value=a.accounts;gmailSetup.value=g;const forwarded=a.accounts.find(account=>account.connectionType==='forwarded_imap');if(forwarded){forwardedSettings.value.emailAddress=forwarded.emailAddress;forwardedSettings.value.provider=forwarded.imapProvider??'qq';if(forwarded.folders){try{const folders=Array.isArray(forwarded.folders)?forwarded.folders:JSON.parse(forwarded.folders);if(Array.isArray(folders)){forwardedSettings.value.folders=folders.join('\n');selectedImapFolders.value=folders;}}catch{/* Keep the default folder when the saved folder list is malformed. */}}}else showImapSetup.value=true;if(selectedSourceKey.value.startsWith('empty:')){emails.value=[];nextCursor.value=null;health.value='ready';return;}const e=await api<{emails:Email[];nextCursor:string|null}>(emailListUrl());if(requestId!==inboxRequestId)return;emails.value=e.emails;nextCursor.value=e.nextCursor;health.value='ready';}catch(e){if(requestId!==inboxRequestId)return;health.value='error';error.value=e instanceof Error?e.message:'无法连接服务';}finally{if(requestId===inboxRequestId)loading.value=false;}}
 async function loadMore(){if(!nextCursor.value||loadingMore.value)return;const requestId=++inboxRequestId;loadingMore.value=true;error.value='';try{const result=await api<{emails:Email[];nextCursor:string|null}>(emailListUrl(nextCursor.value));if(requestId!==inboxRequestId)return;emails.value=[...emails.value,...result.emails];nextCursor.value=result.nextCursor;}catch(e){if(requestId===inboxRequestId)error.value=e instanceof Error?e.message:'无法读取更多邮件';}finally{if(requestId===inboxRequestId)loadingMore.value=false;}}
@@ -49,6 +51,8 @@ function filtersChanged(){void reload();}
 function go(next:Page){page.value=next;selectedEmail.value=null;if(next==='inbox')void reload();if(next==='temporary')void loadTempMailDomains();}
 async function loadTempMailDomains(){if(tempMailDomainsLoading.value)return;tempMailDomainsLoading.value=true;try{const result=await api<{domains:string[]}>('/api/v1/temp-mail/domains');tempMailDomains.value=result.domains;if(!tempMailDomain.value)tempMailDomain.value=result.domains[0]??'';}catch(e){error.value=e instanceof Error?e.message:'无法加载临时邮箱域名';}finally{tempMailDomainsLoading.value=false;}}
 async function createTempMailIoMailbox(custom=false){if(custom&&(!tempMailName.value.trim()||!tempMailDomain.value)){error.value='请填写自定义名称并选择域名';return;}busy.value=true;error.value='';notice.value='';try{const body={provider:'temp_mail_io',ttlMinutes:preferences.value.ttl,...(custom?{name:tempMailName.value.trim(),domain:tempMailDomain.value}:{})};const result=await api<{mailbox:Mailbox}>('/api/v1/mailboxes',{method:'POST',headers:{Origin:location.origin,'Idempotency-Key':crypto.randomUUID()},body:JSON.stringify(body)});mailboxes.value=[result.mailbox,...mailboxes.value.filter(item=>item.id!==result.mailbox.id)];notice.value=`已创建 ${result.mailbox.address}，邮件由 temp-mail.io 接收`;}catch(e){error.value=e instanceof Error?e.message:'外部临时邮箱创建失败';}finally{busy.value=false;}}
+async function loadMailTdDomains(){if(mailTdDomainsLoading.value)return;mailTdDomainsLoading.value=true;try{const result=await api<{domains:string[]}>('/api/v1/mail-td/domains');mailTdDomains.value=result.domains;if(!mailTdDomain.value)mailTdDomain.value=result.domains[0]??'';}catch(e){error.value=e instanceof Error?e.message:'无法加载 mail.td 邮箱域名';}finally{mailTdDomainsLoading.value=false;}}
+async function createMailTdMailbox(custom=false){if(custom&&(!mailTdName.value.trim()||!mailTdDomain.value)){error.value='请填写 mail.td 地址名称并选择域名';return;}busy.value=true;error.value='';notice.value='';try{if(!mailTdDomains.value.length)await loadMailTdDomains();const domain=custom?mailTdDomain.value:mailTdDomains.value[0];if(!domain)throw new Error('mail.td 暂无可用域名');const name=custom?mailTdName.value.trim().toLowerCase():randomMailTdLocalPart(),address=`${name}@${domain}`,password=randomMailTdPassword(),authKey=await deriveMailTdAuthKey(address,password),idempotencyKey=crypto.randomUUID();let difficulty=15,powToken:string|undefined,result:{mailbox:Mailbox}|undefined;for(let attempt=0;attempt<3;attempt++){const t=Math.floor(Date.now()/1000),n=await solveMailTdPow(address,t,difficulty);try{result=await api<{mailbox:Mailbox}>('/api/v1/mailboxes',{method:'POST',headers:{Origin:location.origin,'Idempotency-Key':idempotencyKey},body:JSON.stringify({provider:'mail_td',name,domain,authKey,pow:{t,n,d:difficulty,...(powToken?{token:powToken}:{})},ttlMinutes:preferences.value.ttl})});break;}catch(failure){const challenge=(failure as Error&{code?:string;data?:{error?:{challenge?:{requiredDifficulty?:number;token?:string}}}}).data?.error?.challenge;if((failure as Error&{code?:string}).code!=='MAIL_TD_POW_RETRY'||!challenge||attempt===2)throw failure;difficulty=challenge.requiredDifficulty??difficulty;powToken=challenge.token;}}if(!result)throw new Error('mail.td 邮箱创建重试次数已用完');mailboxes.value=[result.mailbox,...mailboxes.value.filter(item=>item.id!==result!.mailbox.id)];notice.value=`已创建 ${result.mailbox.address}，邮件由 mail.td 接收`;}catch(e){error.value=e instanceof Error?e.message:'mail.td 临时邮箱创建失败';}finally{busy.value=false;}}
 function viewMailbox(box:Mailbox){selectedMailbox.value=box.id;selectedEmail.value=null;activeCategory.value='temporary';selectedSourceKey.value=`temporary:${box.id}`;page.value='inbox';void reload();}
 function selectCategory(category:SourceCategory){activeCategory.value=category;selectedEmail.value=null;selectedMailbox.value='';const match=category==='all'?null:inboxSources.value.find(source=>source.category===category);selectedSourceKey.value=match?.key??(category==='all'?'all':`empty:${category}`);emails.value=[];nextCursor.value=null;if(match||category==='all')void reload();else loading.value=false;}
 function selectInboxSource(source:InboxSource|null){selectedSourceKey.value=source?.key??'all';activeCategory.value=source?.category??'all';selectedMailbox.value=source?.mailboxId??'';selectedEmail.value=null;void reload();}
@@ -88,12 +92,14 @@ onUnmounted(()=>{if(refreshTimer)clearInterval(refreshTimer);if(searchTimer)clea
         </section><footer class="page-note">统一收件箱 · 邮件来源按已连接账号和中转文件夹归类</footer>
       </template>
       <template v-else-if="page==='temporary'">
-        <section class="page-title"><div><p class="eyebrow">TEMPORARY ADDRESSES</p><h1>短暂的地址，完整的掌控。</h1><p>创建 MailHub 自有地址，或使用 temp-mail.io 的临时邮箱。</p></div></section>
+        <section class="page-title"><div><p class="eyebrow">TEMPORARY ADDRESSES</p><h1>短暂的地址，完整的掌控。</h1><p>创建 MailHub 自有地址，或连接 temp-mail.io、mail.td 临时邮箱。</p></div></section>
         <section class="card temporary-tools">
           <div class="temporary-create-actions">
             <button class="button primary" :disabled="busy" @click="createMailbox">＋ MailHub 邮箱</button>
             <button class="button" :disabled="busy" @click="createTempMailIoMailbox(false)">＋ 随机临时邮箱</button>
             <button class="button" :disabled="busy" @click="showTempMailCustomForm=!showTempMailCustomForm;showTempMailCustomForm&&!tempMailDomains.length&&loadTempMailDomains()">{{ showTempMailCustomForm?'收起自定义地址':'＋ 自定义地址' }}</button>
+            <button class="button" :disabled="busy" @click="createMailTdMailbox(false)">＋ mail.td 随机地址</button>
+            <button class="button" :disabled="busy" @click="showMailTdCustomForm=!showMailTdCustomForm;showMailTdCustomForm&&!mailTdDomains.length&&loadMailTdDomains()">{{ showMailTdCustomForm?'收起 mail.td':'＋ mail.td 自定义' }}</button>
             <button class="text-button domain-refresh" :disabled="tempMailDomainsLoading" @click="loadTempMailDomains">{{ tempMailDomainsLoading?'正在读取域名…':'刷新域名' }}</button>
           </div>
           <div v-if="showTempMailCustomForm" class="temp-mail-custom-form">
@@ -102,13 +108,20 @@ onUnmounted(()=>{if(refreshTimer)clearInterval(refreshTimer);if(searchTimer)clea
             <button class="button small primary" :disabled="busy||!tempMailDomains.length" @click="createTempMailIoMailbox(true)">创建自定义邮箱</button>
             <small v-if="!tempMailDomains.length" class="temp-provider-note">{{ tempMailDomainsLoading?'正在读取可用域名…':'域名暂不可用，可稍后刷新；随机地址仍可尝试创建。' }}</small>
           </div>
-          <p class="temporary-tools-note">MailHub 地址由本服务接收；temp-mail.io 地址由外部服务接收。</p>
+          <div v-if="showMailTdCustomForm" class="temp-mail-custom-form">
+            <label><span>mail.td 地址名称</span><input v-model="mailTdName" maxlength="31" autocomplete="off" placeholder="例如 my-account"></label>
+            <label><span>域名</span><select v-model="mailTdDomain" :disabled="!mailTdDomains.length"><option v-for="domain in mailTdDomains" :key="domain" :value="domain">{{ domain }}</option></select></label>
+            <button class="button small primary" :disabled="busy||!mailTdDomains.length" @click="createMailTdMailbox(true)">创建 mail.td 邮箱</button>
+            <button class="text-button" :disabled="mailTdDomainsLoading" @click="loadMailTdDomains">{{ mailTdDomainsLoading?'正在读取域名…':'刷新 mail.td 域名' }}</button>
+            <small v-if="!mailTdDomains.length" class="temp-provider-note">{{ mailTdDomainsLoading?'正在读取可用域名…':'点击刷新以读取 mail.td 可用域名。' }}</small>
+          </div>
+          <p class="temporary-tools-note">MailHub、temp-mail.io 和 mail.td 地址均显示在下方邮箱列表；外部邮箱由对应服务接收，邮件同步后存入 MailHub。</p>
         </section>
         <section class="mailbox-list">
           <div class="mailbox-list-heading"><strong>邮箱列表</strong><span>{{ mailboxes.length }} 个</span></div>
           <article v-for="box in mailboxes" :key="box.id" class="mailbox-row">
-            <span class="mailbox-row-icon" :class="box.provider==='temp_mail_io'?'external':'native'">{{ box.provider==='temp_mail_io'?'T':'M' }}</span>
-            <div class="mailbox-row-address"><strong>{{ box.address }}</strong><small>{{ box.provider==='temp_mail_io'?'temp-mail.io':'MailHub' }}</small></div>
+            <span class="mailbox-row-icon" :class="box.provider==='native'?'native':'external'">{{ box.provider==='native'?'M':box.provider==='mail_td'?'D':'T' }}</span>
+            <div class="mailbox-row-address"><strong>{{ box.address }}</strong><small>{{ box.provider==='mail_td'?'mail.td':box.provider==='temp_mail_io'?'temp-mail.io':'MailHub' }}</small></div>
             <span class="status-badge" :class="box.status">{{ box.status==='active'?'接收中':box.status==='deleting'?'清理中':'已到期' }}</span>
             <div class="mailbox-row-expiry"><strong>{{ box.status==='active'?expiry(box.expiresAt):'不可读取' }}</strong><small>到期 {{ date(box.expiresAt) }}</small></div>
             <div class="mailbox-row-actions"><button class="button small" @click="copyValue(box.address)">复制</button><button class="button small" :disabled="box.status!=='active'" @click="viewMailbox(box)">查看邮件</button><button class="button small" :disabled="busy||box.status!=='active'" @click="renewMailbox(box)">续期</button><button class="button small danger" :disabled="busy||box.status==='deleting'" @click="deleteMailbox(box)">删除</button></div>

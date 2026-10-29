@@ -6,7 +6,7 @@ MailHub 是一个运行在 Cloudflare 上的个人邮箱工作台，提供统一
 
 - **统一收件箱**：汇总邮件来源，支持搜索、未读筛选和分页。
 - **转发汇总邮箱**：通过 IMAP 读取 Gmail、QQ 等邮箱中的转发邮件，并按来源文件夹归类。
-- **临时邮箱**：创建 MailHub 自有地址，或创建 temp-mail.io 随机/自定义地址；支持收件同步、验证码识别、复制地址、续期和删除。
+- **临时邮箱**：创建 MailHub 自有地址，或创建 temp-mail.io、mail.td 随机/自定义地址；支持收件同步、验证码识别、复制地址、续期和删除。
 - **邮件详情**：D1/R2 分层存储邮件信息与正文，提取验证码和邮件链接；HTML 正文经过净化并在隔离 iframe 中显示。
 - **Gmail OAuth**：提供只读 OAuth/PKCE 和增量同步实现；连接前需配置自己的 Google Cloud OAuth 客户端。
 - **访问保护**：生产 API 使用 Cloudflare Access 身份校验。
@@ -21,7 +21,7 @@ MailHub 是一个运行在 Cloudflare 上的个人邮箱工作台，提供统一
 
 ```text
 src/
-  providers/       Gmail、IMAP 和 temp-mail.io 适配器
+  providers/       Gmail、IMAP、temp-mail.io 和 mail.td 适配器
   security/        Access 身份校验、加密与 HTML 净化
   ingestion/       MIME 邮件解析
   worker.ts        Worker API、定时任务和邮件路由
@@ -57,7 +57,7 @@ npm run typecheck
 npm run build
 ```
 
-测试使用模拟数据库、邮件服务器和上游接口；测试不会验证真实 Cloudflare 账户、真实 Gmail 或 temp-mail.io 收件。
+测试使用模拟数据库、邮件服务器和上游接口；测试不会验证真实 Cloudflare 账户、真实 Gmail 或第三方临时邮箱的实时可用性。
 
 ## Cloudflare 配置
 
@@ -98,6 +98,7 @@ node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
 ## 已知限制
 
 - temp-mail.io 集成调用其网页使用的非公开接口；服务端接口或可用域名变化时，适配器可能需要更新。外部邮箱和邮件由该服务接收与保留。
+- mail.td 集成按其网页客户端协议派生 Argon2id 凭据并完成 PoW；Argon2id 在浏览器端计算，只有派生凭据和经 AES-GCM 加密的外部会话保存在 MailHub。第三方协议和域名可能变化，邮件由 mail.td 接收与保留。
 - Gmail 同步需要你自己的 Google OAuth 配置；Gmail 附件同步尚未实现。
 - 生产部署需要单独配置 Cloudflare 资源、Access、邮件路由和 Secrets；模板不会直接部署到任何账户。
 

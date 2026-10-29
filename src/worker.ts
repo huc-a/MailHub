@@ -5,6 +5,7 @@ import { decryptSecret, encryptSecret, randomSecret, sha256Hex } from './securit
 import { GmailApiError, getGmailMessageLabels, getRawGmailMessage, gmailProfile, listGmailHistory, listInboxMessages, refreshGmailAccessToken } from './providers/gmail';
 import { ImapClient, testImapConnection } from './providers/imap';
 import { isTempMailExpired, tempMailCreate, tempMailDomains, tempMailMessages, type TempMailMessage, type TempMailSession } from './providers/temp-mail';
+import { isMailTdUnauthorized, mailTdCreate, mailTdDomains, mailTdLogin, mailTdMessage, mailTdMessages, MailTdPowChallenge, type MailTdMessage, type MailTdPow, type MailTdSession } from './providers/mail-td';
 export interface Env {
   DB: { prepare(query: string): { bind(...values: unknown[]): { first<T>(): Promise<T | null>; all<T>(): Promise<{results?: T[]}>; run(): Promise<{meta?: {changes?: number}}> } }; batch(statements: unknown[]): Promise<unknown[]> };
   MAIL_OBJECTS: { put(key: string, value: ArrayBuffer | ArrayBufferView | string, options?: { httpMetadata?: { contentType?: string } }): Promise<unknown>; get(key: string): Promise<{text(): Promise<string>; arrayBuffer(): Promise<ArrayBuffer>} | null>; delete(keys: string | string[]): Promise<unknown> };
@@ -53,31 +54,57 @@ function attachmentSize(attachment: ParsedAttachment) { return attachment.skippe
 function externalAddress(value:unknown){if(typeof value==='string')return value.slice(0,320);if(value&&typeof value==='object'){const item=value as {address?:unknown;email?:unknown;name?:unknown};return String(item.address??item.email??item.name??'').slice(0,320);}return '';}
 function externalText(value:unknown,maxBytes:number){if(typeof value!=='string')return{value:'',truncated:false};const bytes=new TextEncoder().encode(value);if(bytes.byteLength<=maxBytes)return{value,truncated:false};let end=maxBytes;while(end>0&&(bytes[end]&0xc0)===0x80)end--;return{value:new TextDecoder().decode(bytes.slice(0,end)),truncated:true};}
 function externalParsed(message:TempMailMessage,envelopeTo:string){
-  const text=externalText(message.body_text??message.body,512*1024),html=externalText(message.body_html,Math.max(0,512*1024-new TextEncoder().encode(text.value).byteLength));
-  const plain=text.value||(typeof message.body==='string'?message.body.replace(/<[^>]*>/g,' '):''),snippet=plain.replace(/\s+/g,' ').trim().slice(0,240),otp=[...new Set((plain.match(/(?<!\d)\d{4,8}(?!\d)/g)??[]))].slice(0,5);
-  const created=message.created_at??message.date,receivedAt=typeof created==='number'?created:(typeof created==='string'&&Number.isFinite(Date.parse(created))?Date.parse(created):Date.now());
+  const text=externalText(message.body_text??message.text??message.body,512*1024),html=externalText(message.body_html??message.html,Math.max(0,512*1024-new TextEncoder().encode(text.value).byteLength));
+  const plain=text.value||(typeof message.body==='string'?message.body.replace(/<[^>]*>/g,' '):html.value.replace(/<[^>]*>/g,' ')),snippet=plain.replace(/\s+/g,' ').trim().slice(0,240),otp=[...new Set((plain.match(/(?<!\d)\d{4,8}(?!\d)/g)??[]))].slice(0,5);
+  const created=message.created_at??message.date,receivedAt=typeof created==='number'?(created<1_000_000_000_000?created*1000:created):(typeof created==='string'&&Number.isFinite(Date.parse(created))?Date.parse(created):Date.now());
   const to=Array.isArray(message.to)?message.to.map(externalAddress).filter(Boolean):[envelopeTo];
   return{from:externalAddress(message.from??message.from_addr),to:to.length?to:[envelopeTo],subject:typeof message.subject==='string'?message.subject.slice(0,998):'',messageId:typeof message.message_id==='string'?message.message_id.slice(0,998):'',receivedAt,text:text.value,html:html.value,snippet,otpCandidates:otp,bodyTruncated:text.truncated||html.truncated};
 }
-async function ingestTempMailMessage(env:Env,userId:string,mailboxId:string,generation:number,address:string,message:TempMailMessage){
-  const providerMessageId=`temp-mail-io:${message.id}`.slice(0,998),now=Date.now(),prior=await env.DB.prepare('SELECT id,ingest_status FROM emails WHERE mailbox_id=? AND provider_message_id=?').bind(mailboxId,providerMessageId).first<{id:string;ingest_status:string}>();if(prior?.ingest_status==='ready')return;
+async function ingestTempMailMessage(env:Env,userId:string,mailboxId:string,generation:number,address:string,message:TempMailMessage|MailTdMessage,service:'temp_mail_io'|'mail_td'='temp_mail_io'){
+  const providerMessageId=`${service==='mail_td'?'mail-td':'temp-mail-io'}:${message.id}`.slice(0,998),now=Date.now(),prior=await env.DB.prepare('SELECT id,ingest_status FROM emails WHERE mailbox_id=? AND provider_message_id=?').bind(mailboxId,providerMessageId).first<{id:string;ingest_status:string}>();if(prior?.ingest_status==='ready')return;
   const parsed=externalParsed(message,address),id=prior?.id??crypto.randomUUID(),objects:Array<{id:string;key:string;kind:'text'|'html';data:Uint8Array;contentType:string}>=[];
   if(parsed.text)objects.push({id:`${id}-text`,key:`temporary/${mailboxId}/${id}/text`,kind:'text',data:new TextEncoder().encode(parsed.text),contentType:'text/plain; charset=utf-8'});
   if(parsed.html)objects.push({id:`${id}-html`,key:`temporary/${mailboxId}/${id}/html`,kind:'html',data:new TextEncoder().encode(parsed.html),contentType:'text/html; charset=utf-8'});
-  const statements=[env.DB.prepare("INSERT OR IGNORE INTO emails(id,user_id,source,mailbox_id,provider_message_id,message_id_header,from_address,to_addresses_json,subject,snippet,received_at_ms,created_at_ms,otp_candidates_json,ingest_status,source_generation,body_truncated) SELECT ?,?,'temporary',?,?,?,?,?,?,?,?,?,?,'staged',?,? FROM mailboxes WHERE id=? AND user_id=? AND provider='temp_mail_io' AND status='active' AND generation=? AND expires_at_ms>?").bind(id,userId,mailboxId,providerMessageId,parsed.messageId,parsed.from,JSON.stringify(parsed.to),parsed.subject,parsed.snippet,parsed.receivedAt,now,JSON.stringify(parsed.otpCandidates),generation,parsed.bodyTruncated?1:0,mailboxId,userId,generation,now)];
+  const statements=[env.DB.prepare("INSERT OR IGNORE INTO emails(id,user_id,source,mailbox_id,provider_message_id,message_id_header,from_address,to_addresses_json,subject,snippet,received_at_ms,created_at_ms,otp_candidates_json,ingest_status,source_generation,body_truncated) SELECT ?,?,'temporary',?,?,?,?,?,?,?,?,?,?,'staged',?,? FROM mailboxes WHERE id=? AND user_id=? AND provider='temp_mail_io' AND provider_service=? AND status='active' AND generation=? AND expires_at_ms>?").bind(id,userId,mailboxId,providerMessageId,parsed.messageId,parsed.from,JSON.stringify(parsed.to),parsed.subject,parsed.snippet,parsed.receivedAt,now,JSON.stringify(parsed.otpCandidates),generation,parsed.bodyTruncated?1:0,mailboxId,userId,service,generation,now)];
   for(const object of objects)statements.push(env.DB.prepare("INSERT OR IGNORE INTO mail_objects(id,email_id,kind,object_key,size_bytes,status,created_at_ms) VALUES(?,?,?,?,?,'expected',?)").bind(object.id,id,object.kind,object.key,object.data.byteLength,now));
   await env.DB.batch(statements);for(const object of objects){await env.MAIL_OBJECTS.put(object.key,object.data,{httpMetadata:{contentType:object.contentType}});await env.DB.prepare("UPDATE mail_objects SET status='uploaded',checksum_sha256=? WHERE id=? AND email_id=?").bind(await sha256(object.data),object.id,id).run();}
-  await env.DB.prepare("UPDATE emails SET ingest_status='ready' WHERE id=? AND user_id=? AND ingest_status='staged' AND EXISTS(SELECT 1 FROM mailboxes WHERE id=? AND user_id=? AND provider='temp_mail_io' AND status='active' AND generation=? AND expires_at_ms>?)").bind(id,userId,mailboxId,userId,generation,Date.now()).run();
+  await env.DB.prepare("UPDATE emails SET ingest_status='ready' WHERE id=? AND user_id=? AND ingest_status='staged' AND EXISTS(SELECT 1 FROM mailboxes WHERE id=? AND user_id=? AND provider='temp_mail_io' AND provider_service=? AND status='active' AND generation=? AND expires_at_ms>?)").bind(id,userId,mailboxId,userId,service,generation,Date.now()).run();
 }
 async function syncTempMailMailbox(env:Env,userId:string,mailboxId:string){
-  const now=Date.now(),mailbox=await env.DB.prepare("SELECT address,generation,expires_at_ms AS expiresAt,provider_session_encrypted AS encryptedSession,provider_config_json AS providerConfig,last_provider_poll_at_ms AS lastPoll FROM mailboxes WHERE id=? AND user_id=? AND provider='temp_mail_io' AND status='active'").bind(mailboxId,userId).first<{address:string;generation:number;expiresAt:number;encryptedSession:string|null;providerConfig:string;lastPoll:number|null}>();
+  const now=Date.now(),mailbox=await env.DB.prepare("SELECT address,generation,expires_at_ms AS expiresAt,provider_session_encrypted AS encryptedSession,provider_config_json AS providerConfig,last_provider_poll_at_ms AS lastPoll FROM mailboxes WHERE id=? AND user_id=? AND provider='temp_mail_io' AND provider_service='temp_mail_io' AND status='active'").bind(mailboxId,userId).first<{address:string;generation:number;expiresAt:number;encryptedSession:string|null;providerConfig:string;lastPoll:number|null}>();
   if(!mailbox||mailbox.expiresAt<=now||!mailbox.encryptedSession)return;if(mailbox.lastPoll!==null&&now-mailbox.lastPoll<5000)return;
-  const claimed=await env.DB.prepare('UPDATE mailboxes SET last_provider_poll_at_ms=? WHERE id=? AND user_id=? AND provider=? AND (last_provider_poll_at_ms IS NULL OR last_provider_poll_at_ms<=?)').bind(now,mailboxId,userId,'temp_mail_io',now-5000).run();if(claimed.meta?.changes!==1)return;
+  const claimed=await env.DB.prepare("UPDATE mailboxes SET last_provider_poll_at_ms=? WHERE id=? AND user_id=? AND provider='temp_mail_io' AND provider_service='temp_mail_io' AND (last_provider_poll_at_ms IS NULL OR last_provider_poll_at_ms<=?)").bind(now,mailboxId,userId,now-5000).run();if(claimed.meta?.changes!==1)return;
   if(!env.TOKEN_ENCRYPTION_KEY)throw new Error('TEMP_MAIL_ENCRYPTION_NOT_CONFIGURED');
   let session=JSON.parse(await decryptSecret(mailbox.encryptedSession,env.TOKEN_ENCRYPTION_KEY,`mailbox-provider:${userId}:${mailboxId}:temp-mail-io`)) as TempMailSession,config=JSON.parse(mailbox.providerConfig) as {name?:string;domain?:string;ttlMinutes?:number},address=mailbox.address,generation=mailbox.generation,result;
   try{result=await tempMailMessages(address,session);}catch(failure){if(!isTempMailExpired(failure))throw failure;const renewed=await tempMailCreate(config,session.cookie);address=renewed.email;session=renewed.session;generation++;const encrypted=await encryptSecret(JSON.stringify(session),env.TOKEN_ENCRYPTION_KEY,`mailbox-provider:${userId}:${mailboxId}:temp-mail-io`),expiresAt=Date.now()+Math.max(10,Math.min(1440,config.ttlMinutes??60))*60_000;await env.DB.prepare("UPDATE mailboxes SET address=?,provider_session_encrypted=?,generation=?,created_at_ms=?,expires_at_ms=?,last_provider_poll_at_ms=? WHERE id=? AND user_id=? AND provider='temp_mail_io' AND generation=?").bind(address,encrypted,generation,Date.now(),expiresAt,Date.now(),mailboxId,userId,mailbox.generation).run();result=await tempMailMessages(address,session);}
   if(result.session.cookie!==session.cookie){session=result.session;const encrypted=await encryptSecret(JSON.stringify(session),env.TOKEN_ENCRYPTION_KEY,`mailbox-provider:${userId}:${mailboxId}:temp-mail-io`);await env.DB.prepare("UPDATE mailboxes SET provider_session_encrypted=? WHERE id=? AND user_id=? AND provider='temp_mail_io'").bind(encrypted,mailboxId,userId).run();}
   for(const message of result.messages.slice(0,100))await ingestTempMailMessage(env,userId,mailboxId,generation,address,message);
+}
+
+async function syncMailTdMailbox(env:Env,userId:string,mailboxId:string){
+  const now=Date.now(),mailbox=await env.DB.prepare("SELECT address,generation,expires_at_ms AS expiresAt,provider_session_encrypted AS encryptedSession,provider_config_json AS providerConfig,last_provider_poll_at_ms AS lastPoll FROM mailboxes WHERE id=? AND user_id=? AND provider='temp_mail_io' AND provider_service='mail_td' AND status='active'").bind(mailboxId,userId).first<{address:string;generation:number;expiresAt:number;encryptedSession:string|null;providerConfig:string;lastPoll:number|null}>();
+  if(!mailbox||mailbox.expiresAt<=now||!mailbox.encryptedSession)return;
+  if(mailbox.lastPoll!==null&&now-mailbox.lastPoll<5000)return;
+  const claimed=await env.DB.prepare("UPDATE mailboxes SET last_provider_poll_at_ms=? WHERE id=? AND user_id=? AND provider='temp_mail_io' AND provider_service='mail_td' AND (last_provider_poll_at_ms IS NULL OR last_provider_poll_at_ms<=?)").bind(now,mailboxId,userId,now-5000).run();
+  if(claimed.meta?.changes!==1)return;
+  if(!env.TOKEN_ENCRYPTION_KEY)throw new Error('TEMP_MAIL_ENCRYPTION_NOT_CONFIGURED');
+  const aad=`mailbox-provider:${userId}:${mailboxId}:mail_td`;
+  let session=JSON.parse(await decryptSecret(mailbox.encryptedSession,env.TOKEN_ENCRYPTION_KEY,aad)) as MailTdSession;
+  let messages:MailTdMessage[];
+  try{messages=await mailTdMessages(session);}catch(failure){
+    if(!isMailTdUnauthorized(failure))throw failure;
+    session=await mailTdLogin(session);
+    const encrypted=await encryptSecret(JSON.stringify(session),env.TOKEN_ENCRYPTION_KEY,aad);
+    await env.DB.prepare("UPDATE mailboxes SET provider_session_encrypted=? WHERE id=? AND user_id=? AND provider='temp_mail_io' AND provider_service='mail_td'").bind(encrypted,mailboxId,userId).run();
+    messages=await mailTdMessages(session);
+  }
+  for(const listed of messages.slice(0,10)){
+    const providerMessageId=`mail-td:${listed.id}`.slice(0,998),prior=await env.DB.prepare('SELECT ingest_status FROM emails WHERE mailbox_id=? AND provider_message_id=?').bind(mailboxId,providerMessageId).first<{ingest_status:string}>();
+    if(prior?.ingest_status==='ready')continue;
+    let detail:Record<string,unknown>;
+    try{detail=await mailTdMessage(session,listed.id);}catch{detail={};}
+    await ingestTempMailMessage(env,userId,mailboxId,mailbox.generation,mailbox.address,{...listed,...detail,id:listed.id},'mail_td');
+  }
 }
 
 function oauthRedirect(env: Env, result: string) {
@@ -276,7 +303,7 @@ async function cleanupMailbox(env: Env, mailboxId: string, userId: string, jobId
     env.DB.prepare('DELETE FROM email_attachments WHERE email_id IN (SELECT id FROM emails WHERE mailbox_id=? AND user_id=?)').bind(mailboxId,userId),
     env.DB.prepare('DELETE FROM mail_objects WHERE email_id IN (SELECT id FROM emails WHERE mailbox_id=? AND user_id=?)').bind(mailboxId,userId),
     env.DB.prepare('DELETE FROM emails WHERE mailbox_id=? AND user_id=?').bind(mailboxId,userId),
-    env.DB.prepare("UPDATE mailboxes SET status='deleted',provider_session_encrypted=NULL,provider_config_json='{}' WHERE id=? AND user_id=? AND status='deleting'").bind(mailboxId,userId),
+    env.DB.prepare("UPDATE mailboxes SET status='deleted',provider_session_encrypted=NULL,provider_config_json='{}',provider_service=NULL WHERE id=? AND user_id=? AND status='deleting'").bind(mailboxId,userId),
     env.DB.prepare("UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at_ms=NULL,error_code=NULL,updated_at_ms=? WHERE id=? AND lease_token=?").bind(now,jobId,lease),
   ]);
 }
@@ -405,33 +432,38 @@ const worker = {
       return json({authorizationUrl:authorization.toString()});
     }
     if (url.pathname === '/api/v1/mailboxes' && request.method === 'GET') {
-      const result = await env.DB.prepare("SELECT id,address,provider,CASE WHEN status='active' AND expires_at_ms<=? THEN 'expired' ELSE status END AS status,created_at_ms AS createdAt,expires_at_ms AS expiresAt FROM mailboxes WHERE user_id=? AND status IN ('active','expired') ORDER BY created_at_ms DESC LIMIT 100").bind(Date.now(),owner).all<Record<string, unknown>>();
+      const result = await env.DB.prepare("SELECT id,address,COALESCE(provider_service,provider) AS provider,CASE WHEN status='active' AND expires_at_ms<=? THEN 'expired' ELSE status END AS status,created_at_ms AS createdAt,expires_at_ms AS expiresAt FROM mailboxes WHERE user_id=? AND status IN ('active','expired') ORDER BY created_at_ms DESC LIMIT 100").bind(Date.now(),owner).all<Record<string, unknown>>();
       return json({ mailboxes: result.results ?? [] });
     }
     if(url.pathname==='/api/v1/temp-mail/domains'&&request.method==='GET'){
       try{return json({domains:await tempMailDomains()});}catch(failure){const code=failure instanceof Error?failure.message:'TEMP_MAIL_UPSTREAM_ERROR';return error(code,'无法读取临时邮箱域名列表，请稍后重试',502);}
     }
+    if(url.pathname==='/api/v1/mail-td/domains'&&request.method==='GET'){
+      try{return json({domains:await mailTdDomains()});}catch(failure){const code=failure instanceof Error?failure.message:'MAIL_TD_UPSTREAM_ERROR';return error(code,'无法读取 mail.td 临时邮箱域名，请稍后重试',502);}
+    }
     if (url.pathname === '/api/v1/mailboxes' && request.method === 'POST') {
       if (!sameOrigin(request)) return error('CSRF_REJECTED', 'Same-origin request required', 403);
       if (!validJson(request)) return error('UNSUPPORTED_MEDIA_TYPE', 'Content-Type must be application/json', 415);
-      let body: { ttlMinutes?: unknown;provider?:unknown;name?:unknown;domain?:unknown };
+      let body: { ttlMinutes?: unknown;provider?:unknown;name?:unknown;domain?:unknown;authKey?:unknown;pow?:unknown };
       try { body = await request.json() as typeof body; } catch { return error('INVALID_JSON', 'Request body must be JSON', 400); }
       const ttl = body.ttlMinutes === undefined ? 60 : body.ttlMinutes;
       if (![10, 30, 60, 1440].includes(ttl as number)) return error('INVALID_TTL', 'ttlMinutes must be 10, 30, 60 or 1440', 400);
       const provider=body.provider===undefined?'native':body.provider;
-      if(provider!=='native'&&provider!=='temp_mail_io')return error('INVALID_MAILBOX_PROVIDER','Unsupported temporary mailbox provider',400);
+      if(provider!=='native'&&provider!=='temp_mail_io'&&provider!=='mail_td')return error('INVALID_MAILBOX_PROVIDER','Unsupported temporary mailbox provider',400);
       const name=typeof body.name==='string'?body.name.trim().toLowerCase():'';
       const domain=typeof body.domain==='string'?body.domain.trim().toLowerCase():'';
       if(provider==='temp_mail_io'&&((name&&!/^[a-zA-Z0-9][a-zA-Z0-9._-]{1,30}$/.test(name))||(!name&&domain)||Boolean(name&&!domain)))return error('INVALID_CUSTOM_ADDRESS','Enter a valid custom mailbox name and domain, or leave both blank for a random address',400);
+      if(provider==='mail_td'&&(!/^[a-z0-9][a-z0-9._-]{1,30}$/i.test(name)||!/^[a-z0-9.-]{1,253}$/i.test(domain)||typeof body.authKey!=='string'||!/^[a-f0-9]{64}$/i.test(body.authKey)||!body.pow||typeof body.pow!=='object'))return error('INVALID_CUSTOM_ADDRESS','Enter a valid mail.td address, derived key and proof of work',400);
       if(provider==='temp_mail_io'&&!env.TOKEN_ENCRYPTION_KEY)return error('TEMP_MAIL_ENCRYPTION_NOT_CONFIGURED','Mailbox session encryption is not configured',503);
+      if(provider==='mail_td'&&!env.TOKEN_ENCRYPTION_KEY)return error('TEMP_MAIL_ENCRYPTION_NOT_CONFIGURED','Mailbox session encryption is not configured',503);
       const key = request.headers.get('Idempotency-Key');
       if (!key || key.length > 128) return error('IDEMPOTENCY_KEY_REQUIRED', 'A valid Idempotency-Key is required', 400);
-      const requestHash = await digest(JSON.stringify({ ttlMinutes: ttl,provider,name:name||null,domain:domain||null }));
+      const requestHash = await digest(JSON.stringify({ ttlMinutes: ttl,provider,name:name||null,domain:domain||null,...(provider==='mail_td'?{authKey:body.authKey}:{}) }));
       const old = await env.DB.prepare('SELECT request_hash,resource_id FROM idempotency_keys WHERE user_id=? AND route=? AND request_key=? AND expires_at_ms>?').bind(owner, '/mailboxes', key, Date.now()).first<{ request_hash: string; resource_id: string | null }>();
       if (old) {
         if (old.request_hash !== requestHash) return error('IDEMPOTENCY_CONFLICT', 'Key was already used for a different request', 409);
         if (old.resource_id) {
-          const prior = await env.DB.prepare('SELECT id,address,provider,status,created_at_ms AS createdAt,expires_at_ms AS expiresAt FROM mailboxes WHERE id=? AND user_id=?').bind(old.resource_id, owner).first();
+          const prior = await env.DB.prepare('SELECT id,address,COALESCE(provider_service,provider) AS provider,status,created_at_ms AS createdAt,expires_at_ms AS expiresAt FROM mailboxes WHERE id=? AND user_id=?').bind(old.resource_id, owner).first();
           if (prior) return json({ mailbox: prior }, 200);
         }
       }
@@ -440,9 +472,15 @@ const worker = {
       const now = Date.now(), id = crypto.randomUUID();let address='',providerSession:string|null=null,providerConfig={name:name||undefined,domain:domain||undefined,ttlMinutes:ttl as number};
       if(provider==='native'){
         for(let attempt=0;attempt<4;attempt++){address=`${localPart()}@${env.MAIL_DOMAIN.toLowerCase()}`;try{await env.DB.prepare("INSERT INTO mailboxes(id,user_id,address,created_at_ms,expires_at_ms,provider,provider_config_json) VALUES(?,?,?,?,?,'native','{}')").bind(id,owner,address,now,now+(ttl as number)*60_000).run();break;}catch(e){if(attempt===3)throw e;}}
-      }else{
+      }else if(provider==='temp_mail_io'){
         if(name){let domains:string[];try{domains=await tempMailDomains();}catch(failure){return error(failure instanceof Error?failure.message:'TEMP_MAIL_UPSTREAM_ERROR','无法验证临时邮箱域名，请稍后重试',502);}if(!domains.includes(domain))return error('INVALID_TEMP_MAIL_DOMAIN','Select a public domain from the available list',400);}
-        try{const created=await tempMailCreate(name?{name,domain}:{minNameLength:10,maxNameLength:10});address=created.email;providerSession=await encryptSecret(JSON.stringify(created.session),env.TOKEN_ENCRYPTION_KEY!,`mailbox-provider:${owner}:${id}:temp-mail-io`);await env.DB.prepare("INSERT INTO mailboxes(id,user_id,address,created_at_ms,expires_at_ms,provider,provider_session_encrypted,provider_config_json) VALUES(?,?,?,?,?,'temp_mail_io',?,?)").bind(id,owner,address,now,now+(ttl as number)*60_000,providerSession,JSON.stringify(providerConfig)).run();}catch(failure){const code=failure instanceof Error?failure.message:'TEMP_MAIL_UPSTREAM_ERROR';return error(code,'无法创建外部临时邮箱，请稍后重试',502);}
+        try{const created=await tempMailCreate(name?{name,domain}:{minNameLength:10,maxNameLength:10});address=created.email;providerSession=await encryptSecret(JSON.stringify(created.session),env.TOKEN_ENCRYPTION_KEY!,`mailbox-provider:${owner}:${id}:temp-mail-io`);await env.DB.prepare("INSERT INTO mailboxes(id,user_id,address,created_at_ms,expires_at_ms,provider,provider_service,provider_session_encrypted,provider_config_json) VALUES(?,?,?,?,?,'temp_mail_io','temp_mail_io',?,?)").bind(id,owner,address,now,now+(ttl as number)*60_000,providerSession,JSON.stringify(providerConfig)).run();}catch(failure){const code=failure instanceof Error?failure.message:'TEMP_MAIL_UPSTREAM_ERROR';return error(code,'无法创建外部临时邮箱，请稍后重试',502);}
+      }
+      if(provider==='mail_td'){
+        let domains:string[];try{domains=await mailTdDomains();}catch(failure){const code=failure instanceof Error?failure.message:'MAIL_TD_UPSTREAM_ERROR';return error(code,'无法验证 mail.td 邮箱域名，请稍后重试',502);}
+        if(!domains.includes(domain))return error('INVALID_TEMP_MAIL_DOMAIN','请选择 mail.td 提供的可用域名',400);
+        address=`${name}@${domain}`;
+        try{const created=await mailTdCreate(address,String(body.authKey),body.pow as MailTdPow);address=created.address;providerSession=await encryptSecret(JSON.stringify(created.session),env.TOKEN_ENCRYPTION_KEY!,`mailbox-provider:${owner}:${id}:mail_td`);providerConfig={name,domain,ttlMinutes:ttl as number};await env.DB.prepare("INSERT INTO mailboxes(id,user_id,address,created_at_ms,expires_at_ms,provider,provider_service,provider_session_encrypted,provider_config_json) VALUES(?,?,?,?,?,'temp_mail_io','mail_td',?,?)").bind(id,owner,address,now,now+(ttl as number)*60_000,providerSession,JSON.stringify(providerConfig)).run();}catch(failure){if(failure instanceof MailTdPowChallenge)return json({error:{code:'MAIL_TD_POW_RETRY',message:'mail.td 要求提高工作量证明难度，请稍后重试',retryable:true,challenge:{requiredDifficulty:failure.requiredDifficulty,token:failure.challengeToken},requestId:crypto.randomUUID()}},428);const code=failure instanceof Error?failure.message:'MAIL_TD_UPSTREAM_ERROR';return error(code,'mail.td 邮箱创建失败，请稍后重试',502);}
       }
       await env.DB.prepare('INSERT INTO idempotency_keys(user_id,request_key,route,request_hash,resource_id,expires_at_ms) VALUES(?,?,?,?,?,?)').bind(owner,key,'/mailboxes',requestHash,id,now+86_400_000).run();
       return json({ mailbox: { id, address, provider, status: 'active', createdAt: now, expiresAt: now+(ttl as number)*60_000 } }, 201);
@@ -495,7 +533,7 @@ const worker = {
       if (folder && accountId) return error('INVALID_SOURCE_FILTER','Choose either a provider account or a forwarding folder',400);
       if (unread !== null && unread !== 'true' && unread !== 'false') return error('INVALID_UNREAD_FILTER', 'unread must be true or false', 400);
       if (search.length > 120) return error('INVALID_QUERY', 'Search text must be 120 characters or fewer', 400);
-      if(mailboxId){const mailbox=await env.DB.prepare('SELECT provider,status,expires_at_ms AS expiresAt FROM mailboxes WHERE id=? AND user_id=?').bind(mailboxId,owner).first<{provider:string;status:string;expiresAt:number}>();if(mailbox?.provider==='temp_mail_io'&&mailbox.status==='active'&&mailbox.expiresAt>Date.now()){try{await syncTempMailMailbox(env,owner,mailboxId);}catch(failure){const code=failure instanceof Error?failure.message:'TEMP_MAIL_UPSTREAM_ERROR';return error(code,'读取外部临时邮箱失败，请稍后刷新',502);}}}
+      if(mailboxId){const mailbox=await env.DB.prepare('SELECT COALESCE(provider_service,provider) AS provider,status,expires_at_ms AS expiresAt FROM mailboxes WHERE id=? AND user_id=?').bind(mailboxId,owner).first<{provider:string;status:string;expiresAt:number}>();if(mailbox?.provider==='temp_mail_io'&&mailbox.status==='active'&&mailbox.expiresAt>Date.now()){try{await syncTempMailMailbox(env,owner,mailboxId);}catch(failure){const code=failure instanceof Error?failure.message:'TEMP_MAIL_UPSTREAM_ERROR';return error(code,'读取外部临时邮箱失败，请稍后刷新',502);} }else if(mailbox?.provider==='mail_td'&&mailbox.status==='active'&&mailbox.expiresAt>Date.now()){try{await syncMailTdMailbox(env,owner,mailboxId);}catch(failure){const code=failure instanceof Error?failure.message:'MAIL_TD_UPSTREAM_ERROR';return error(code,'读取 mail.td 邮件失败，请稍后刷新',502);}}}
       const clauses = ["user_id=?", "ingest_status='ready'"], values: unknown[] = [owner];
       if (folder) {
         const linked = await env.DB.prepare("SELECT id,sync_scope_json AS syncScope FROM provider_accounts WHERE user_id=? AND provider='gmail' AND json_extract(sync_scope_json,'$.connectionType')='forwarded_imap'").bind(owner).all<{id:string;syncScope:string}>();
