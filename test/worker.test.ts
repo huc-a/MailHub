@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import worker, { syncFailureCode, type Env } from '../src/worker';
-import { encryptSecret } from '../src/security/crypto';
+import { decryptSecret, encryptSecret } from '../src/security/crypto';
 
 afterEach(()=>vi.unstubAllGlobals());
 
@@ -84,6 +84,22 @@ describe('Worker API foundation', () => {
     const db={prepare:(sql:string)=>({bind:(...values:unknown[])=>({first:async()=>({id:'owner-1'}),all:async()=>{if(sql.includes('FROM provider_accounts'))return{results:[{id:'hub-1',syncScope:JSON.stringify({connectionType:'forwarded_imap',folders:['My Folders/person@example.net']})}]};if(sql.includes('FROM emails WHERE')){emailQuery=sql;emailValues=values;}return{results:[]};},run:async()=>({meta:{changes:0}})})}),batch:async()=>[]};
     const response=await worker.fetch(new Request('https://mailhub.test/api/v1/emails?source=forwarded&folder=INBOX',{headers:{'X-MailHub-Local-Subject':'owner'}}),env({APP_ENV:'local',ALLOW_LOCAL_AUTH:'true',DB:db as unknown as Env['DB']}));
     expect(response.status).toBe(200);expect(emailQuery).toContain('provider_account_id=?');expect(emailValues).toContain('imap:INBOX:');
+  });
+  it('imports temp-mail.io messages into the owner mailbox and R2-backed email detail', async()=>{
+    const mailboxId='11111111-1111-4111-8111-111111111111',key=btoa('k'.repeat(32)),encrypted=await encryptSecret(JSON.stringify({token:'provider-token',cookie:'sid=cookie'}),key,`mailbox-provider:owner-1:${mailboxId}:temp-mail-io`),queries:string[]=[],storedKeys:string[]=[];expect(await decryptSecret(encrypted,key,`mailbox-provider:owner-1:${mailboxId}:temp-mail-io`)).toContain('provider-token');
+    vi.stubGlobal('fetch',vi.fn(async()=>Response.json([{id:'message-1',from:'sender@example.test',to:'random@temp.test',subject:'Login code',body_text:'Your code is 123456',body_html:'<p>Your code is 123456</p>',created_at:'2026-10-29T00:00:00Z'}])));
+    const row={id:'email-1',source:'temporary',mailboxId,providerMessageId:'temp-mail-io:message-1',fromAddress:'sender@example.test',subject:'Login code',snippet:'Your code is 123456',receivedAt:1793232000000,localIsRead:0};
+    const db={prepare:(sql:string)=>({bind:(...values:unknown[])=>({sql,values,first:async<T,>()=>{queries.push(sql);if(sql.includes('FROM users'))return{id:'owner-1'};if(sql.includes('SELECT provider,status,expires_at_ms'))return{provider:'temp_mail_io',status:'active',expiresAt:Date.now()+60000};if(sql.includes('SELECT address,generation'))return{address:'random@temp.test',generation:0,expiresAt:Date.now()+60000,encryptedSession:encrypted,providerConfig:'{"ttlMinutes":60}',lastPoll:null};if(sql.includes('SELECT id,ingest_status'))return null;return null as T|null;},all:async<T,>()=>{queries.push(sql);return{results:(sql.includes('FROM emails WHERE')?[row]:[]) as T[]};},run:async()=>({meta:{changes:1}})} )}),batch:async(statements:unknown[])=>{for(const statement of statements as Array<{sql?:string}>){if(statement.sql)queries.push(statement.sql);}return[];}};
+    const response=await worker.fetch(new Request('https://mailhub.test/api/v1/emails?mailboxId=11111111-1111-4111-8111-111111111111',{headers:{'X-MailHub-Local-Subject':'owner'}}),env({APP_ENV:'local',ALLOW_LOCAL_AUTH:'true',TOKEN_ENCRYPTION_KEY:key,DB:db as unknown as Env['DB'],MAIL_OBJECTS:{put:async(key:string)=>{storedKeys.push(key);},get:async()=>null,delete:async()=>{}} as unknown as Env['MAIL_OBJECTS']}));
+    expect(response.status,JSON.stringify(await response.clone().json())).toBe(200);expect(await response.json()).toMatchObject({emails:[{id:'email-1',subject:'Login code'}]});expect(queries.some(sql=>sql.includes("INSERT OR IGNORE INTO emails")&&sql.includes("'temporary'"))).toBe(true);expect(storedKeys.some(key=>key.startsWith('temporary/11111111-1111-4111-8111-111111111111/'))).toBe(true);
+  });
+  it('creates a public-domain external mailbox while keeping its provider session encrypted',async()=>{
+    const key=btoa('z'.repeat(32)),writes:Array<{sql:string;values:unknown[]}>=[];let createPayload:unknown;
+    vi.stubGlobal('fetch',vi.fn(async(input:RequestInfo|URL,init?:RequestInit)=>{const request=new Request(input,init);if(request.url.endsWith('/v4/domains'))return Response.json({domains:[{name:'example.test',type:'public'}]});createPayload=await request.clone().json();return Response.json({email:'my-box@example.test',token:'provider-secret'},{headers:{'Set-Cookie':'sid=session-cookie; Path=/; HttpOnly'}});}));
+    const db={prepare:(sql:string)=>({bind:(...values:unknown[])=>({first:async<T,>()=>{if(sql.includes('FROM users'))return{id:'owner-1'};if(sql.includes('idempotency_keys'))return null;if(sql.includes('COUNT(*)'))return{count:0};return null as T|null;},all:async()=>({results:[]}),run:async()=>{writes.push({sql,values});return{meta:{changes:1}};}})}),batch:async()=>[]};
+    const response=await worker.fetch(new Request('http://localhost/api/v1/mailboxes',{method:'POST',headers:{Origin:'http://localhost','Content-Type':'application/json','Idempotency-Key':'external-mail-test','X-MailHub-Local-Subject':'owner'},body:JSON.stringify({provider:'temp_mail_io',name:'my-box',domain:'example.test',ttlMinutes:60})}),env({APP_ENV:'local',ALLOW_LOCAL_AUTH:'true',TOKEN_ENCRYPTION_KEY:key,DB:db as unknown as Env['DB']}));
+    const body=await response.json() as {mailbox:{id:string;address:string;provider:string}};const stored=writes.find(item=>item.sql.includes('INSERT INTO mailboxes'));
+    expect(response.status).toBe(201);expect(body.mailbox).toMatchObject({address:'my-box@example.test',provider:'temp_mail_io'});expect(createPayload).toEqual({name:'my-box',domain:'example.test'});expect(JSON.stringify(body)).not.toContain('provider-secret');expect(stored).toBeDefined();expect(String(stored?.values[5])).not.toContain('provider-secret');expect(await decryptSecret(String(stored?.values[5]),key,`mailbox-provider:owner-1:${body.mailbox.id}:temp-mail-io`)).toContain('provider-secret');
   });
   it('limits all-forwarded view to configured hub accounts rather than OAuth Gmail', async () => {
     let emailQuery='',emailValues:unknown[]=[];
